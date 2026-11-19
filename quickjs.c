@@ -48,7 +48,9 @@
 #include "libregexp.h"
 #include "dtoa.h"
 
-#if defined(EMSCRIPTEN) || defined(_MSC_VER)
+/* Melt: on 68k, Retro68 can't relocate a table of label addresses (&&label) in data into a
+ * multi-segment application's code: the interpreter switches instead */
+#if defined(EMSCRIPTEN) || defined(_MSC_VER) || (defined(macintosh) && defined(__m68k__))
 #define DIRECT_DISPATCH  0
 #else
 #define DIRECT_DISPATCH  1
@@ -72,7 +74,7 @@
 // atomic_store etc. are completely busted in recent versions of tcc;
 // somehow the compiler forgets to load |ptr| into %rdi when calling
 // the __atomic_*() helpers in its lib/stdatomic.c and lib/atomic.S
-#if !defined(__TINYC__) && !defined(EMSCRIPTEN) && !defined(__wasi__) && !__STDC_NO_ATOMICS__ && !defined(__DJGPP)
+#if !defined(__TINYC__) && !defined(EMSCRIPTEN) && !defined(__wasi__) && !__STDC_NO_ATOMICS__ && !defined(__DJGPP) && !defined(macintosh) /* Melt: no SharedArrayBuffer waits */
 #include "quickjs-c-atomics.h"
 #define CONFIG_ATOMICS
 #endif

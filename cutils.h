@@ -61,7 +61,7 @@ extern "C" {
 #include <windows.h>
 #include <process.h> // _beginthread
 #endif
-#if !defined(_WIN32) && !defined(EMSCRIPTEN) && !defined(__wasi__) && !defined(__DJGPP)
+#if !defined(_WIN32) && !defined(EMSCRIPTEN) && !defined(__wasi__) && !defined(__DJGPP) && !defined(macintosh) /* Melt: classic Mac OS has no threads */
 #include <errno.h>
 #include <pthread.h>
 #endif
@@ -638,7 +638,7 @@ static inline int js_exepath(char* buffer, size_t* size);
 
 /* Cross-platform threading APIs. */
 
-#if defined(EMSCRIPTEN) || defined(__wasi__) || defined(__DJGPP)
+#if defined(EMSCRIPTEN) || defined(__wasi__) || defined(__DJGPP) || defined(macintosh) /* Melt */
 
 #define JS_HAVE_THREADS 0
 
@@ -1607,7 +1607,7 @@ static inline uint64_t js__hrtime_ns(void) {
 }
 #else
 static inline uint64_t js__hrtime_ns(void) {
-#ifdef __DJGPP
+#if defined(__DJGPP) || defined(macintosh) /* Melt: no clock_gettime */
   struct timeval tv;
   if (gettimeofday(&tv, NULL))
     abort();
