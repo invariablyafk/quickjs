@@ -50,11 +50,14 @@
 
 /* Melt: on 68k, Retro68 can't relocate a table of label addresses (&&label) in data into a
  * multi-segment application's code: the interpreter switches instead */
+#ifndef DIRECT_DISPATCH     /* Melt: overridable, to test the switch interpreter on PowerPC */
 #if defined(EMSCRIPTEN) || defined(_MSC_VER) || (defined(macintosh) && defined(__m68k__))
 #define DIRECT_DISPATCH  0
 #else
 #define DIRECT_DISPATCH  1
 #endif
+#endif
+
 
 #if defined(__APPLE__)
 #define MALLOC_OVERHEAD  0
@@ -85,6 +88,18 @@
 
 #ifndef NDEBUG
 #define ENABLE_DUMPS
+#endif
+
+/* Melt: Retro68's PowerPC GCC (16.1) expands alloca() wrongly when the frame's outgoing-argument
+ * area plus the 24-byte linkage area isn't a multiple of 16 (JS_CallInternal's is 72): the block
+ * starts at sp + 80 (rounded up from sp + 72 for the 16-byte alignment) but only round16(size)
+ * bytes are taken off sp, so the block's last 8 bytes are the first 8 bytes of the function's own
+ * locals.  In JS_CallInternal that is `pr` (find_own_property's `*ppr = ...`), aliasing the
+ * JS value stack's top slot: a JSValue whose low word is right and whose tag word is a heap
+ * address or 0.  16 spare bytes keep the whole request inside the block (rig/abitest alloca_overlap). */
+#if defined(__ppc__) || defined(__PPC__)
+#undef alloca
+#define alloca(n) __builtin_alloca((n) + 16)
 #endif
 
 //#define FORCE_GC_AT_MALLOC  /* test the GC by forcing it before each object allocation */
