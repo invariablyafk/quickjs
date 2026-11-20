@@ -572,7 +572,10 @@ enum {
 
 /* must be large enough to have a negligible runtime cost and small
    enough to call the interrupt callback often. */
+/* Melt: overridable; the Mac builds ask for it more often (plat_busy keeps the window alive from it) */
+#ifndef JS_INTERRUPT_COUNTER_INIT
 #define JS_INTERRUPT_COUNTER_INIT 10000
+#endif
 
 struct JSContext {
     JSGCObjectHeader header; /* must come first */
