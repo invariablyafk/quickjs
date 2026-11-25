@@ -284,6 +284,34 @@ static inline int ctz64(uint64_t a)
 #endif
 }
 
+#ifdef MELT_BC_BE_EMU
+/* Melt: a little-endian host that writes bytecode for the big-endian Macs (tools/shipped_bc): every
+ * multi-byte access to bytecode goes through these helpers, so reading them big-endian makes the
+ * compiler and JS_WriteObject produce big-endian bytes.  Only that tool's QuickJS is built this
+ * way, and it never runs what it compiles. */
+static inline uint64_t get_u64(const uint8_t *t)
+{
+    return ((uint64_t)t[0] << 56) | ((uint64_t)t[1] << 48) | ((uint64_t)t[2] << 40) | ((uint64_t)t[3] << 32) |
+           ((uint64_t)t[4] << 24) | ((uint64_t)t[5] << 16) | ((uint64_t)t[6] << 8) | t[7];
+}
+static inline int64_t get_i64(const uint8_t *t) { return (int64_t)get_u64(t); }
+static inline void put_u64(uint8_t *t, uint64_t v)
+{
+    for (int i = 0; i < 8; i++) t[i] = (uint8_t)(v >> (56 - 8 * i));
+}
+static inline uint32_t get_u32(const uint8_t *t)
+{
+    return ((uint32_t)t[0] << 24) | ((uint32_t)t[1] << 16) | ((uint32_t)t[2] << 8) | t[3];
+}
+static inline int32_t get_i32(const uint8_t *t) { return (int32_t)get_u32(t); }
+static inline void put_u32(uint8_t *t, uint32_t v)
+{
+    t[0] = (uint8_t)(v >> 24); t[1] = (uint8_t)(v >> 16); t[2] = (uint8_t)(v >> 8); t[3] = (uint8_t)v;
+}
+static inline uint32_t get_u16(const uint8_t *t) { return ((uint32_t)t[0] << 8) | t[1]; }
+static inline int32_t get_i16(const uint8_t *t) { return (int16_t)get_u16(t); }
+static inline void put_u16(uint8_t *t, uint16_t v) { t[0] = (uint8_t)(v >> 8); t[1] = (uint8_t)v; }
+#else
 static inline uint64_t get_u64(const uint8_t *tab)
 {
     uint64_t v;
@@ -340,6 +368,7 @@ static inline void put_u16(uint8_t *tab, uint16_t val)
 {
     memcpy(tab, &val, sizeof(val));
 }
+#endif
 
 static inline uint32_t get_u8(const uint8_t *tab)
 {
@@ -843,17 +872,35 @@ static inline int __dbuf_putc(DynBuf *s, uint8_t c)
 
 static inline int __dbuf_put_u16(DynBuf *s, uint16_t val)
 {
+#ifdef MELT_BC_BE_EMU
+    uint8_t t[2];                       /* Melt: big-endian, like put_u16 (above) */
+    put_u16(t, val);
+    return dbuf_put(s, t, 2);
+#else
     return dbuf_put(s, (uint8_t *)&val, 2);
+#endif
 }
 
 static inline int __dbuf_put_u32(DynBuf *s, uint32_t val)
 {
+#ifdef MELT_BC_BE_EMU
+    uint8_t t[4];                       /* Melt: big-endian, like put_u32 (above) */
+    put_u32(t, val);
+    return dbuf_put(s, t, 4);
+#else
     return dbuf_put(s, (uint8_t *)&val, 4);
+#endif
 }
 
 static inline int __dbuf_put_u64(DynBuf *s, uint64_t val)
 {
+#ifdef MELT_BC_BE_EMU
+    uint8_t t[8];                       /* Melt: big-endian, like put_u64 (above) */
+    put_u64(t, val);
+    return dbuf_put(s, t, 8);
+#else
     return dbuf_put(s, (uint8_t *)&val, 8);
+#endif
 }
 
 static inline int dbuf_putstr(DynBuf *s, const char *str)

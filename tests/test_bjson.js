@@ -262,7 +262,7 @@ function bjson_test_csum()
             try {
                 bjson.read(buf, 0, buf.byteLength);
             } catch (e) {
-                caught = /checksum error/.test(e.message);
+                caught = /checksum error|invalid bytecode length/.test(e.message);
             }
             assert(caught);
             tab[i] = t;
@@ -279,7 +279,7 @@ function bjson_test_truncated_bigint()
         try {
             bjson.read(buf, 0, n);
         } catch (e) {
-            caught = /read after the end of the buffer/.test(e.message);
+            caught = /read after the end of the buffer|invalid bytecode length/.test(e.message);
         }
         assert(caught);
     }

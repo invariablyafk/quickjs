@@ -463,6 +463,9 @@ static inline bool JS_VALUE_IS_NAN(JSValue v)
 /* allow top-level await in normal script. JS_Eval() returns a
    promise. Only allowed with JS_EVAL_TYPE_GLOBAL */
 #define JS_EVAL_FLAG_ASYNC (1 << 7)
+/* Melt: with JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY, don't resolve (load) the imported
+   modules yet; call JS_ResolveModule() later, once they are all compiled */
+#define JS_EVAL_FLAG_DEFER_RESOLVE (1 << 8)
 
 typedef JSValue JSCFunction(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 typedef JSValue JSCFunctionMagic(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
@@ -513,6 +516,8 @@ JS_EXTERN JSRuntime *JS_NewRuntime(void);
 JS_EXTERN void JS_SetRuntimeInfo(JSRuntime *rt, const char *info);
 /* use 0 to disable memory limit */
 JS_EXTERN void JS_SetMemoryLimit(JSRuntime *rt, size_t limit);
+/* Melt: an allocation was refused since the last call (clears the flag) */
+JS_EXTERN int JS_TakeMemoryLimitHit(JSRuntime *rt);
 JS_EXTERN void JS_SetDumpFlags(JSRuntime *rt, uint64_t flags);
 JS_EXTERN uint64_t JS_GetDumpFlags(JSRuntime *rt);
 JS_EXTERN size_t JS_GetGCThreshold(JSRuntime *rt);
@@ -522,6 +527,16 @@ JS_EXTERN void JS_SetMaxStackSize(JSRuntime *rt, size_t stack_size);
 /* should be called when changing thread to update the stack top value
    used to check stack overflow. */
 JS_EXTERN void JS_UpdateStackTop(JSRuntime *rt);
+/* Melt: the deepest stack the checks saw since the reset (bytes below the top) */
+JS_EXTERN void JS_MeltStackReset(JSRuntime *rt);
+JS_EXTERN size_t JS_MeltStackUsed(JSRuntime *rt);
+#ifdef MELT_TELEMETRY
+/* Melt (host builds only): called when a property read finds nothing on the object or its chain (before the
+   undefined is returned), for the missing-API telemetry (engine/telemetry.h).  Must not throw or call script. */
+typedef void (*JSMeltMissingPropHook)(JSContext *ctx, JSAtom prop);
+JS_EXTERN void JS_MeltSetMissingPropHook(JSMeltMissingPropHook fn);
+#endif
+JS_EXTERN unsigned JS_MeltStackOverflows(JSRuntime *rt);   /* stack overflow RangeErrors thrown since the runtime began */
 JS_EXTERN JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque);
 JS_EXTERN void JS_FreeRuntime(JSRuntime *rt);
 JS_EXTERN void *JS_GetRuntimeOpaque(JSRuntime *rt);
@@ -607,6 +622,7 @@ typedef struct JSMemoryUsage {
 } JSMemoryUsage;
 
 JS_EXTERN void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s);
+JS_EXTERN void JS_MeltClassCensus(JSRuntime *rt, FILE *fp);
 JS_EXTERN void JS_DumpMemoryUsage(FILE *fp, const JSMemoryUsage *s, JSRuntime *rt);
 
 /* atom support */
@@ -1277,6 +1293,9 @@ JS_EXTERN int JS_FinishDynamicImport(JSContext *ctx, JSValue token,
 /* return the import.meta object of a module */
 JS_EXTERN JSValue JS_GetImportMeta(JSContext *ctx, JSModuleDef *m);
 JS_EXTERN JSAtom JS_GetModuleName(JSContext *ctx, JSModuleDef *m);
+/* Melt: frees a compiled module nothing has used yet, and its entry in the context's module list; 0, or -1 for
+   a value that is not such a module (nothing freed).  The caller's reference to it is gone. */
+JS_EXTERN int JS_DiscardModule(JSContext *ctx, JSValue module);
 JS_EXTERN JSValue JS_GetModuleNamespace(JSContext *ctx, JSModuleDef *m);
 
 /* associate a JSValue to a C module */
@@ -1300,6 +1319,10 @@ typedef struct JSSABTab {
 } JSSABTab;
 
 /* Object Writer/Reader (currently only used to handle precompiled code) */
+/* Melt: BC_VERSION, the first byte of what JS_WriteObject writes */
+JS_EXTERN int JS_GetBytecodeVersion(void);
+/* Melt: the number of precompiled builtins (builtin-*.h) not of that version (0 when all match) */
+JS_EXTERN int JS_CountStaleBuiltinBytecode(void);
 #define JS_WRITE_OBJ_BYTECODE  (1 << 0) /* allow function/module */
 #define JS_WRITE_OBJ_BSWAP     (0)      /* byte swapped output (obsolete, handled transparently) */
 #define JS_WRITE_OBJ_SAB       (1 << 2) /* allow SharedArrayBuffer */
@@ -1320,15 +1343,43 @@ JS_EXTERN uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst o
    writer in the same process (e.g. another Worker on the same runtime). */
 #define JS_READ_OBJ_SAB       (1 << 2) /* allow SharedArrayBuffer */
 #define JS_READ_OBJ_REFERENCE (1 << 3) /* allow object references */
+/* Melt: a module read from bytecode doesn't resolve (load) its imports now; JS_ResolveModule() does
+   later, once they are all compiled or read */
+#define JS_READ_OBJ_DEFER_RESOLVE (1 << 4)
 JS_EXTERN JSValue JS_ReadObject(JSContext *ctx, const uint8_t *buf, size_t buf_len, int flags);
 JS_EXTERN JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
                                  int flags, JSSABTab *psab_tab);
+/* Melt: lazy reading of bytecode kept in a file (or anything that can fetch a byte range).
+   Only the object's top level (a script's or module's own function, its constants and its
+   atom table) is read now; every function nested in it becomes a stub that has its header (so a
+   closure can be made from it) and loads its body, with its own nested functions as stubs in
+   turn, from 'read' on its first call.  'read' copies 'len' bytes at 'offset' of the serialised
+   object into 'buf' and returns 0, or returns -1; it is called with ranges inside [0, file_len)
+   only, and a body whose bytes have changed (a checksum each) or can't be read throws an
+   exception when the function is called: no byte of a body is run unchecked.  'close' (may be
+   NULL) is called once, with 'opaque', when no stub needs the file any more or at once when
+   reading failed, from the thread that calls into the context.  The atom table stays in memory
+   until then; a body is read through one 8 KB block that the runtime's files share, which
+   JS_FreeBCBlock() frees (the next load allocates it again).  JS_READ_OBJ_REFERENCE and JS_READ_OBJ_SAB are not
+   supported.  The bytes are what JS_WriteObject() made. */
+typedef int JSBCReadFunc(void *opaque, size_t offset, void *buf, size_t len);
+typedef void JSBCCloseFunc(void *opaque);
+JS_EXTERN void JS_FreeBCBlock(JSRuntime *rt);
+JS_EXTERN void JS_SetBCBlockSize(JSRuntime *rt, size_t size);   /* Melt: 1 KB..64 KB, default 8 KB */
+JS_EXTERN JSValue JS_ReadObjectLazy(JSContext *ctx, size_t file_len, int flags,
+                                    JSBCReadFunc *read, JSBCCloseFunc *close, void *opaque);
 /* instantiate and evaluate a bytecode function. Only used when
    reading a script or module with JS_ReadObject() */
 JS_EXTERN JSValue JS_EvalFunction(JSContext *ctx, JSValue fun_obj);
 /* load the dependencies of the module 'obj'. Useful when JS_ReadObject()
    returns a module. */
 JS_EXTERN int JS_ResolveModule(JSContext *ctx, JSValueConst obj);
+/* Melt: a module's requested specifiers (see quickjs.c) */
+JS_EXTERN int JS_GetModuleRequestCount(JSContext *ctx, JSModuleDef *m);
+/* Melt: names of the bindings left uninitialised (m NULL: global let/const; a module: its exports, once it threw) */
+JS_EXTERN int JS_UninitializedNames(JSContext *ctx, JSModuleDef *m, char *names, int name_size, int max);
+JS_EXTERN JSAtom JS_GetModuleRequestName(JSContext *ctx, JSModuleDef *m, int i);
+JS_EXTERN JSValue JS_GetModuleRequestAttributes(JSContext *ctx, JSModuleDef *m, int i);
 
 /* only exported for os.Worker() */
 JS_EXTERN JSAtom JS_GetScriptOrModuleName(JSContext *ctx, int n_stack_levels);
