@@ -530,6 +530,15 @@ JS_EXTERN void JS_UpdateStackTop(JSRuntime *rt);
 /* Melt: the deepest stack the checks saw since the reset (bytes below the top) */
 JS_EXTERN void JS_MeltStackReset(JSRuntime *rt);
 JS_EXTERN size_t JS_MeltStackUsed(JSRuntime *rt);
+#ifdef MELT_DEEP_CENSUS
+/* Melt (MELT_DEEP_CENSUS builds only): the heap by object, one line at a time to sink (PLAN-memory.md "The blank page's heap") */
+JS_EXTERN void JS_MeltDeepCensus(JSRuntime *rt, void (*sink)(const char *line));
+#endif
+#ifdef MELT_COMPILE_PROFILE
+/* Melt (MELT_COMPILE_PROFILE builds only): after each compile of 32 KB or more of heap, calls sink with one line per category of what the
+   heap was made of at the compile's peak (PLAN-memory.md "The compile peak") */
+JS_EXTERN void JS_MeltCompileProfile(void (*sink)(const char *line));
+#endif
 #ifdef MELT_TELEMETRY
 /* Melt (host builds only): called when a property read finds nothing on the object or its chain (before the
    undefined is returned), for the missing-API telemetry (engine/telemetry.h).  Must not throw or call script. */

@@ -266,9 +266,18 @@ typedef enum {
     JS_GC_PHASE_REMOVE_CYCLES,
 } JSGCPhaseEnum;
 
+#ifdef MELT_COMPILE_PROFILE
+#define MELT_PEAK(s) do { if ((s)->malloc_size > (s)->malloc_peak) (s)->malloc_peak = (s)->malloc_size; } while (0)
+#else
+#define MELT_PEAK(s) ((void)0)
+#endif
+
 typedef struct JSMallocState {
     size_t malloc_count;
     size_t malloc_size;
+#ifdef MELT_COMPILE_PROFILE
+    size_t malloc_peak; /* Melt: high-water mark of malloc_size (compile profile) */
+#endif
     size_t malloc_limit;
     int limit_hit; /* Melt: an allocation was refused (see JS_TakeMemoryLimitHit) */
     void *opaque; /* user opaque */
@@ -2070,6 +2079,7 @@ void *js_calloc_rt(JSRuntime *rt, size_t count, size_t size)
 
     s->malloc_count++;
     s->malloc_size += js_arena_usable_size(rt, ptr) + MALLOC_OVERHEAD;
+    MELT_PEAK(s);
     return ptr;
 }
 
@@ -2097,6 +2107,7 @@ void *js_malloc_rt(JSRuntime *rt, size_t size)
 
     s->malloc_count++;
     s->malloc_size += js_arena_usable_size(rt, ptr) + MALLOC_OVERHEAD;
+    MELT_PEAK(s);
     return ptr;
 }
 
@@ -2147,6 +2158,7 @@ void *js_realloc_rt(JSRuntime *rt, void *ptr, size_t size)
     }
 
     s->malloc_size += js_arena_usable_size(rt, ptr) - old_size;
+    MELT_PEAK(s);
     return ptr;
 }
 
@@ -7745,7 +7757,7 @@ void JS_MeltClassCensus(JSRuntime *rt, FILE *fp)
         }
     }
     {   /* big objects: prop_count >= 64 */
-        long nb = 0, pb = 0, sb = 0, mx = 0; int sz[8] = {0};
+        long nb = 0, pb = 0, sb = 0, mx = 0;
         list_for_each(el, &rt->gc_obj_list) {
             JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
             JSObject *p;
@@ -7811,6 +7823,198 @@ void JS_MeltClassCensus(JSRuntime *rt, FILE *fp)
 #else
 void JS_MeltClassCensus(JSRuntime *rt, FILE *fp) { (void)rt; (void)fp; }
 #endif
+
+#ifdef MELT_DEEP_CENSUS
+/* Melt: the heap by object (MELT_DEEP_CENSUS; PLAN-memory.md "The blank page's heap").  One walk over the GC list, the shape
+   table and the atom table; every figure is bytes in the allocator's blocks (usable size, plus MALLOC_OVERHEAD per block, as
+   malloc_size counts), so the total is what the heap holds.  Lines go to `sink`; the host prints them with MELT_JS_CENSUS=1,
+   the Macs with --heap-census.  It allocates a few KB while it runs. */
+typedef struct DCClass { long n, slots, used; size_t body, props; } DCClass;
+typedef struct DCFn { long n, slots, vr_n; size_t body, props, vr; long len_n, name_n, proto_n, other_n; long autoinit, varref, normal, getset; } DCFn;
+
+void JS_MeltDeepCensus(JSRuntime *rt, void (*sink)(const char *line))
+{
+    struct list_head *el;
+    char ln[330];
+    size_t total = rt->malloc_state.malloc_size;     /* before the census's own tables */
+    int i, nc = rt->class_count, nfiles = 0;
+    DCClass *cls = js_mallocz_rt(rt, nc * sizeof(DCClass));
+    int *fileref = js_mallocz_rt(rt, rt->atom_size * sizeof(int));
+    JSBCFile *files[16];
+    DCFn fn_all, fn_unl, fn_c;
+    long n_bc = 0, n_stub = 0, n_loaded = 0, n_vrobj = 0, n_shape = 0, n_files_atoms = 0, n_objs = 0;
+    size_t b_stub = 0, b_loaded_hdr = 0, b_loaded_body = 0, b_pc2line = 0, b_source = 0, b_vrobj = 0, b_shape = 0, b_arrvals = 0;
+    size_t b_obj = 0, b_props = 0, b_files = 0, b_fileatoms = 0, b_atoms_fileonly = 0, b_atoms = 0, b_atoms_str = 0, b_blk = 0;
+    long n_arrvals = 0, fast_arrays = 0, slots = 0, used = 0, t_norm = 0, t_getset = 0, t_varref = 0, t_auto = 0, n_fileonly = 0;
+    size_t b_proto_obj = 0, b_proto_props = 0;
+    size_t stub_cv = 0, stub_vd = 0;
+    long stub_cvn = 0;
+    long n_proto_mat = 0;
+    size_t total_seen;
+#define L(...) do { snprintf(ln, sizeof ln, __VA_ARGS__); sink(ln); } while (0)
+#define BLK(p) ((p) ? js_malloc_usable_size_rt(rt, (p)) + MALLOC_OVERHEAD : (size_t)0)
+    if (!cls || !fileref) { js_free_rt(rt, cls); js_free_rt(rt, fileref); return; }
+    memset(&fn_all, 0, sizeof fn_all); memset(&fn_unl, 0, sizeof fn_unl); memset(&fn_c, 0, sizeof fn_c);
+
+    list_for_each(el, &rt->gc_obj_list) {
+        JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
+        switch (JS_GC_TYPE(gp)) {
+        case JS_GC_OBJ_TYPE_FUNCTION_BYTECODE: {
+            JSFunctionBytecode *b = (JSFunctionBytecode *)gp;
+            n_bc++;
+            if (JS_BC_UNLOADED(b)) {
+                int k;
+                n_stub++; b_stub += BLK(b);
+                stub_cv += b->closure_var_count * sizeof(JSClosureVar); stub_cvn += b->closure_var_count;
+                for (k = 0; k < nfiles && files[k] != b->lazy->file; k++) ;
+                if (k == nfiles && nfiles < 16) files[nfiles++] = b->lazy->file;
+            } else {
+                n_loaded++; b_loaded_hdr += BLK(b);
+                if (b->lazy) b_loaded_body += BLK(b->lazy->body);
+                b_pc2line += BLK(b->pc2line_buf);
+                b_source += BLK(b->source);
+            }
+            break; }
+        case JS_GC_OBJ_TYPE_VAR_REF:
+            n_vrobj++; b_vrobj += BLK(gp);
+            break;
+        case JS_GC_OBJ_TYPE_JS_OBJECT: {
+            JSObject *p = (JSObject *)gp;
+            JSShape *sh = p->shape;
+            DCClass *c = &cls[p->class_id < nc ? p->class_id : 0];
+            size_t body = BLK(p), props = BLK(p->prop);
+            JSShapeProperty *prs = get_shape_prop(sh);
+            int k;
+            n_objs++;
+            c->n++; c->body += body; c->props += props; c->slots += sh->prop_size; c->used += sh->prop_count;
+            b_obj += body; b_props += props; slots += sh->prop_size; used += sh->prop_count;
+            if (!sh->is_hashed) { n_shape++; b_shape += BLK(get_alloc_from_shape(sh)); }
+            for (k = 0; k < sh->prop_count; k++) {
+                if (prs[k].atom == JS_ATOM_NULL) continue;
+                switch (prs[k].flags & JS_PROP_TMASK) {
+                case JS_PROP_NORMAL: t_norm++; break;
+                case JS_PROP_GETSET: t_getset++; break;
+                case JS_PROP_VARREF: t_varref++; break;
+                default: t_auto++; break;
+                }
+            }
+            if (p->class_id == JS_CLASS_ARRAY || p->class_id == JS_CLASS_ARGUMENTS) {
+                fast_arrays += p->fast_array;
+                if (p->fast_array && p->u.array.u.values) { n_arrvals += p->u.array.count; b_arrvals += BLK(p->u.array.u.values); }
+            }
+            if (p->class_id == JS_CLASS_C_FUNCTION || js_class_has_bytecode(p->class_id)) {
+                DCFn *f[2];
+                int nf = 0, fi;
+                JSFunctionBytecode *b = NULL;
+                if (p->class_id == JS_CLASS_C_FUNCTION) f[nf++] = &fn_c;
+                else {
+                    b = p->u.func.function_bytecode;
+                    f[nf++] = &fn_all;
+                    if (JS_BC_UNLOADED(b)) f[nf++] = &fn_unl;
+                }
+                for (fi = 0; fi < nf; fi++) {
+                    DCFn *d = f[fi];
+                    d->n++; d->body += body; d->props += props; d->slots += sh->prop_size;
+                    if (b && p->u.func.var_refs) { d->vr_n++; d->vr += BLK(p->u.func.var_refs); }
+                    for (k = 0; k < sh->prop_count; k++) {
+                        int tm = prs[k].flags & JS_PROP_TMASK;
+                        if (prs[k].atom == JS_ATOM_NULL) continue;
+                        if (prs[k].atom == JS_ATOM_length) d->len_n++;
+                        else if (prs[k].atom == JS_ATOM_name) d->name_n++;
+                        else if (prs[k].atom == JS_ATOM_prototype) d->proto_n++;
+                        else d->other_n++;
+                        if (tm == JS_PROP_AUTOINIT) d->autoinit++;
+                        else if (tm == JS_PROP_VARREF) d->varref++;
+                        else if (tm == JS_PROP_GETSET) d->getset++;
+                        else d->normal++;
+                    }
+                }
+                /* a materialised default prototype: the object a function's `prototype` holds, with only `constructor` on it */
+                for (k = 0; k < sh->prop_count; k++)
+                    if (prs[k].atom == JS_ATOM_prototype && !(prs[k].flags & JS_PROP_TMASK) && JS_VALUE_GET_TAG(p->prop[k].u.value) == JS_TAG_OBJECT) {
+                        JSObject *q = JS_VALUE_GET_OBJ(p->prop[k].u.value);
+                        if (q->class_id == JS_CLASS_OBJECT && q->shape->prop_count == 1) {
+                            n_proto_mat++; b_proto_obj += BLK(q); b_proto_props += BLK(q->prop);
+                        }
+                    }
+            }
+            break; }
+        default:
+            break;
+        }
+    }
+    /* hashed shapes */
+    for (i = 0; i < rt->shape_hash_size; i++) {
+        JSShape *sh;
+        for (sh = rt->shape_hash[i]; sh; sh = sh->shape_hash_next) { n_shape++; b_shape += BLK(get_alloc_from_shape(sh)); }
+    }
+    /* atoms: the table, the strings, and those only a lazily read file holds */
+    b_atoms = BLK(rt->atom_array) + BLK(rt->atom_hash);
+    for (i = 0; i < nfiles; i++) {
+        JSBCFile *f = files[i];
+        uint32_t j;
+        b_files += BLK(f); b_fileatoms += BLK(f->atoms); n_files_atoms += f->atom_count;
+        for (j = 0; j < f->atom_count; j++)
+            if (!__JS_AtomIsConst(f->atoms[j]) && (int)f->atoms[j] < rt->atom_size) fileref[f->atoms[j]]++;
+    }
+    for (i = 0; i < rt->atom_size; i++) {
+        JSAtomStruct *p = rt->atom_array[i];
+        if (atom_is_free(p)) continue;
+        b_atoms_str += BLK(p);
+        if (fileref[i] && JS_REF_COUNT(p) == fileref[i]) { n_fileonly++; b_atoms_fileonly += BLK(p); }
+    }
+    b_blk = BLK(rt->bc_blk);
+
+    total_seen = b_obj + b_props + b_shape + b_arrvals + b_vrobj + b_stub + b_loaded_hdr + b_loaded_body + b_pc2line + b_source +
+                 b_atoms + b_atoms_str + b_files + b_fileatoms + b_blk + fn_all.vr;
+    L("dcensus: heap %ld B; accounted below %ld B; the rest %ld B (strings, runtime, context, class tables, ropes, other blocks)",
+      (long)total, (long)total_seen, (long)(total - total_seen));
+    L("dcensus: objects %ld (%ld B of bodies) + property arrays %ld B (%ld slots allocated, %ld used) + shapes %ld (%ld B)",
+      n_objs, (long)b_obj, (long)b_props, slots, used, n_shape, (long)b_shape);
+    L("dcensus: used slots by kind: plain value %ld, accessor %ld, variable reference %ld, auto-init %ld; slot %d B; unused slots %ld (%ld B)",
+      t_norm, t_getset, t_varref, t_auto, (int)sizeof(JSProperty), slots - used, (long)((slots - used) * sizeof(JSProperty)));
+    L("dcensus: arrays %ld fast, %ld elements in %ld B; var-ref objects %ld (%ld B); closure var-ref arrays %ld B",
+      fast_arrays, n_arrvals, (long)b_arrvals, n_vrobj, (long)b_vrobj, (long)fn_all.vr);
+    L("dcensus: function bytecode %ld: stubs %ld (%ld B), loaded %ld (headers %ld B, bodies %ld B, pc2line %ld B, source %ld B)",
+      n_bc, n_stub, (long)b_stub, n_loaded, (long)b_loaded_hdr, (long)b_loaded_body, (long)b_pc2line, (long)b_source);
+    L("dcensus: a stub is %d B of header + %d B of lazy record + its closure variables (%ld of them, %d B each, %ld B in all) + the allocator's rounding and header; the stubs' blocks above are %ld B",
+      (int)sizeof(JSFunctionBytecode), (int)sizeof(JSLazyBC), stub_cvn, (int)sizeof(JSClosureVar), (long)stub_cv, (long)b_stub);
+    L("dcensus: lazy files %d: structs %ld B, atom arrays %ld B (%ld atoms); read block %ld B; atoms held only by a file: %ld (%ld B of atom strings)",
+      nfiles, (long)b_files, (long)b_fileatoms, n_files_atoms, (long)b_blk, n_fileonly, (long)b_atoms_fileonly);
+    L("dcensus: atoms: table (array + hash) %ld B, %ld atoms, strings %ld B", (long)b_atoms, (long)rt->atom_count, (long)b_atoms_str);
+#define FN(tag, d) L("dcensus: %s %ld: bodies %ld B, property arrays %ld B (%ld slots), closure arrays %ld B (%ld functions); own props: length %ld, name %ld, prototype %ld, other %ld; " \
+                     "kinds: plain %ld, auto-init %ld, var-ref %ld, accessor %ld", tag, (d).n, (long)(d).body, (long)(d).props, (d).slots, (long)(d).vr, (d).vr_n, \
+                     (d).len_n, (d).name_n, (d).proto_n, (d).other_n, (d).normal, (d).autoinit, (d).varref, (d).getset)
+    FN("JS function objects", fn_all);
+    FN("  of them never called (body not loaded)", fn_unl);
+    FN("C function objects", fn_c);
+    L("dcensus: materialised default prototype objects %ld (%ld B of bodies, %ld B of property arrays)", n_proto_mat, (long)b_proto_obj, (long)b_proto_props);
+    for (i = 0; i < nc; i++) {
+        if (cls[i].n >= 10 || cls[i].body + cls[i].props >= 1024) {
+            char nb[ATOM_GET_STR_BUF_SIZE];
+            L("dcensus: class %3d %-22s %6ld objects, %7ld B bodies, %7ld B property arrays (%ld slots, %ld used)",
+              i, JS_AtomGetStrRT(rt, nb, sizeof nb, rt->class_array[i].class_name), cls[i].n, (long)cls[i].body, (long)cls[i].props, cls[i].slots, cls[i].used);
+        }
+    }
+    {   /* the allocator's size classes: blocks in use, the arena pages behind them */
+        int c;
+        long tot_used = 0, tot_pages = 0;
+        for (c = 0; c < JS_ARENA_BLOCK_SIZE_COUNT; c++) {
+            struct list_head *e2;
+            long u = 0, na = 0;
+            list_for_each(e2, &rt->arena_state.arena_list[c]) { u += list_entry(e2, JSArena, link)->n_used_blocks; na++; }
+            if (u) L("dcensus: size class %3d B: %6ld blocks in use, %7ld B in use, %4ld arena pages (%ld B)", arena_block_sizes[c], u, u * arena_block_sizes[c], na, na * JS_ARENA_SIZE);
+            tot_used += u * arena_block_sizes[c]; tot_pages += na * JS_ARENA_SIZE;
+        }
+        L("dcensus: small blocks: %ld B in use in %ld B of arena pages (%ld B of free slots and page slack)", tot_used, tot_pages, tot_pages - tot_used);
+    }
+#undef FN
+#undef BLK
+#undef L
+    js_free_rt(rt, cls);
+    js_free_rt(rt, fileref);
+}
+#endif /* MELT_DEEP_CENSUS */
 
 void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)
 {
@@ -33410,6 +33614,225 @@ static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd)
 
 #endif // QJS_DISABLE_PARSER
 
+
+#ifdef MELT_COMPILE_PROFILE
+/* Melt: compile-peak attribution (MELT_COMPILE_PROFILE; PLAN-memory.md "The compile peak").  Off in every shipping build.
+   A compile's heap is sampled at the points where the first-pass buffers, the second-pass copy and the finished functions
+   coexist (the end of the parse, and the two passes that copy a function's code), keeping the sample with the largest heap;
+   `malloc_peak` is the allocator's own high-water mark, to show the samples missed nothing. */
+typedef struct CPSample {
+    int valid;
+    const char *where;
+    size_t total, resolve_out;
+    long blocks;
+    size_t fd_struct, code_alloc, code_used, pc2line, labels, jumps, srcloc, vars, scopes, globals, closure, cpool_arr, source;
+    size_t cpool_str, atoms;
+    size_t b_header, b_cpool, b_vardefs, b_closure, b_code, b_round, b_pc2line, b_source, b_str;
+    long nfd, nfin;
+} CPSample;
+static struct {
+    int depth;
+    JSFunctionDef *root;
+    size_t input_len, base, base_atoms, base_blocks, parse_end;
+    CPSample best;
+    void (*sink)(const char *line);
+} cp;
+
+void JS_MeltCompileProfile(void (*sink)(const char *line)) { cp.sink = sink; }
+
+static size_t cp_blk(JSRuntime *rt, const void *p, long *blocks)
+{
+    if (!p) return 0;
+    (*blocks)++;
+    return js_malloc_usable_size_rt(rt, p) + MALLOC_OVERHEAD;
+}
+
+static size_t cp_atoms(JSRuntime *rt, long *blocks)
+{
+    size_t n = 0;
+    int i;
+    n += cp_blk(rt, rt->atom_array, blocks) + cp_blk(rt, rt->atom_hash, blocks);
+    for (i = 0; i < rt->atom_size; i++) {
+        JSAtomStruct *p = rt->atom_array[i];
+        if (!atom_is_free(p)) n += cp_blk(rt, p, blocks);
+    }
+    return n;
+}
+
+static void cp_value(JSRuntime *rt, JSValue v, CPSample *c);
+
+static void cp_finished(JSRuntime *rt, JSFunctionBytecode *b, CPSample *c)
+{
+    size_t whole = cp_blk(rt, b, &c->blocks), used;
+    int i;
+    c->nfin++;
+    c->b_header += (sizeof(*b) + 7) & ~(size_t)7;
+    c->b_cpool += b->cpool_count * sizeof(JSValue);
+    c->b_vardefs += (b->arg_count + b->var_count) * sizeof(JSVarDef);
+    c->b_closure += b->closure_var_count * sizeof(JSClosureVar);
+    c->b_code += b->byte_code_len;
+    used = ((sizeof(*b) + 7) & ~(size_t)7) + b->cpool_count * sizeof(JSValue) + (b->arg_count + b->var_count) * sizeof(JSVarDef) +
+           b->closure_var_count * sizeof(JSClosureVar) + b->byte_code_len;
+    c->b_round += whole > used ? whole - used : 0;
+    c->b_pc2line += cp_blk(rt, b->pc2line_buf, &c->blocks);
+    c->b_source += cp_blk(rt, b->source, &c->blocks);
+    for (i = 0; i < b->cpool_count; i++) cp_value(rt, b->cpool[i], c);
+}
+
+static void cp_value(JSRuntime *rt, JSValue v, CPSample *c)
+{
+    switch (JS_VALUE_GET_TAG(v)) {
+    case JS_TAG_FUNCTION_BYTECODE: cp_finished(rt, JS_VALUE_GET_PTR(v), c); break;
+    case JS_TAG_STRING: case JS_TAG_STRING_ROPE: c->b_str += cp_blk(rt, JS_VALUE_GET_PTR(v), &c->blocks); break;
+    default: break;
+    }
+}
+
+static void cp_fd(JSRuntime *rt, JSFunctionDef *fd, CPSample *c)
+{
+    struct list_head *el;
+    int i;
+    c->nfd++;
+    c->fd_struct += cp_blk(rt, fd, &c->blocks);
+    c->code_alloc += cp_blk(rt, fd->byte_code.buf, &c->blocks);
+    c->code_used += fd->byte_code.size;
+    c->pc2line += cp_blk(rt, fd->pc2line.buf, &c->blocks);
+    c->labels += cp_blk(rt, fd->label_slots, &c->blocks);
+    c->jumps += cp_blk(rt, fd->jump_slots, &c->blocks);
+    c->srcloc += cp_blk(rt, fd->source_loc_slots, &c->blocks);
+    c->vars += cp_blk(rt, fd->vars, &c->blocks) + cp_blk(rt, fd->vars_htab, &c->blocks) + cp_blk(rt, fd->args, &c->blocks);
+    if (fd->scopes != fd->def_scope_array) c->scopes += cp_blk(rt, fd->scopes, &c->blocks);
+    c->globals += cp_blk(rt, fd->global_vars, &c->blocks);
+    c->closure += cp_blk(rt, fd->closure_var, &c->blocks);
+    c->cpool_arr += cp_blk(rt, fd->cpool, &c->blocks);
+    c->source += cp_blk(rt, fd->source, &c->blocks);
+    for (i = 0; i < fd->cpool_count; i++) {
+        JSValue v = fd->cpool[i];
+        if (JS_VALUE_GET_TAG(v) == JS_TAG_STRING || JS_VALUE_GET_TAG(v) == JS_TAG_STRING_ROPE)
+            c->cpool_str += cp_blk(rt, JS_VALUE_GET_PTR(v), &c->blocks);
+        else
+            cp_value(rt, v, c);
+    }
+    list_for_each(el, &fd->child_list) cp_fd(rt, list_entry(el, JSFunctionDef, link), c);
+}
+
+/* sample the compile now when its heap is the largest seen; `out` is a second-pass code buffer alive beside the first */
+static void cp_sample(JSContext *ctx, const char *where, const DynBuf *out)
+{
+    JSRuntime *rt = ctx->rt;
+    CPSample c;
+    long dummy = 0;
+    if (cp.depth != 1 || !cp.root || rt->malloc_state.malloc_size <= cp.best.total) return;
+    memset(&c, 0, sizeof c);
+    c.valid = 1;
+    c.where = where;
+    c.total = rt->malloc_state.malloc_size;
+    if (out) c.resolve_out = cp_blk(rt, out->buf, &c.blocks);
+    cp_fd(rt, cp.root, &c);
+    c.atoms = cp_atoms(rt, &dummy);
+    cp.best = c;
+}
+
+static void cp_begin(JSContext *ctx, size_t input_len)
+{
+    JSRuntime *rt = ctx->rt;
+    long b = 0;
+    if (cp.depth++) return;
+    memset(&cp.best, 0, sizeof cp.best);
+    cp.root = NULL;
+    cp.input_len = input_len;
+    cp.base = rt->malloc_state.malloc_size;
+    cp.base_atoms = cp_atoms(rt, &b);
+    rt->malloc_state.malloc_peak = rt->malloc_state.malloc_size;
+}
+
+static CPSample cp_end_sample;
+static void cp_end(JSContext *ctx, JSValue r)
+{
+    JSRuntime *rt = ctx->rt;
+    long b = 0;
+    memset(&cp_end_sample, 0, sizeof cp_end_sample);
+    if (cp.depth != 1 || JS_VALUE_GET_TAG(r) != JS_TAG_FUNCTION_BYTECODE) return;
+    cp_end_sample.valid = 1;
+    cp_end_sample.total = rt->malloc_state.malloc_size;
+    cp_end_sample.atoms = cp_atoms(rt, &b);
+    cp_finished(rt, JS_VALUE_GET_PTR(r), &cp_end_sample);
+}
+
+static void cp_report(JSContext *ctx, const char *filename, int ok)
+{
+    JSRuntime *rt = ctx->rt;
+    CPSample *c = &cp.best;
+    char ln[300];
+    size_t delta, att, other;
+    long dummy = 0;
+    if (--cp.depth) return;
+    cp.root = NULL;
+    if (!cp.sink || rt->malloc_state.malloc_peak - cp.base < 32768) return;     /* none, or a small eval */
+    if (!c->valid) {
+        snprintf(ln, sizeof ln, "cprof %.60s: %s; %ld bytes of source; heap before %ld, allocator peak %ld (+%ld); no sample taken (stopped while parsing)",
+                 filename, ok ? "ok" : "FAILED", (long)cp.input_len, (long)cp.base, (long)rt->malloc_state.malloc_peak, (long)(rt->malloc_state.malloc_peak - cp.base));
+        cp.sink(ln);
+        return;
+    }
+    delta = c->total - cp.base;
+#define L(...) do { snprintf(ln, sizeof ln, __VA_ARGS__); cp.sink(ln); } while (0)
+#define P(name, v) L("cprof   %-34s %8ld B %3ld.%ld%%", name, (long)(v), delta ? (long)(((v) >> 4) * 1000 / ((delta >> 4) + 1)) / 10 : 0L, delta ? (long)(((v) >> 4) * 1000 / ((delta >> 4) + 1)) % 10 : 0L)
+    L("cprof %.60s: %s; %ld bytes of source; heap before %ld, allocator peak %ld (+%ld), sampled peak %ld (+%ld) at \"%s\"; "
+      "%ld functions in first pass, %ld finished; %ld blocks walked, malloc overhead %d per block; sizeof JSValue %d, ptr %d, JSFunctionDef %d, JSFunctionBytecode %d, JSVarDef %d",
+      filename, ok ? "ok" : "FAILED", (long)cp.input_len, (long)cp.base, (long)rt->malloc_state.malloc_peak, (long)(rt->malloc_state.malloc_peak - cp.base),
+      (long)c->total, (long)delta, c->where, c->nfd, c->nfin, c->blocks, MALLOC_OVERHEAD, (int)sizeof(JSValue), (int)sizeof(void *),
+      (int)sizeof(JSFunctionDef), (int)sizeof(JSFunctionBytecode), (int)sizeof(JSVarDef));
+    P("first pass: code buffers (alloc)", c->code_alloc);
+    L("cprof     (of which code bytes used)         %8ld B", (long)c->code_used);
+    P("first pass: pc2line buffers", c->pc2line);
+    P("first pass: label slots", c->labels);
+    P("first pass: jump slots", c->jumps);
+    P("first pass: source-loc slots", c->srcloc);
+    P("first pass: vars, args, hash", c->vars);
+    P("first pass: scopes", c->scopes);
+    P("first pass: global vars", c->globals);
+    P("first pass: closure vars", c->closure);
+    P("first pass: cpool arrays", c->cpool_arr);
+    P("first pass: cpool strings", c->cpool_str);
+    P("first pass: per-function source copies", c->source);
+    P("first pass: JSFunctionDef structs", c->fd_struct);
+    P("second pass copy being built", c->resolve_out);
+    P("finished: headers", c->b_header);
+    P("finished: cpool", c->b_cpool);
+    P("finished: vardefs", c->b_vardefs);
+    P("finished: closure vars", c->b_closure);
+    P("finished: code", c->b_code);
+    P("finished: block rounding", c->b_round);
+    P("finished: pc2line", c->b_pc2line);
+    P("finished: source copies", c->b_source);
+    P("finished: cpool strings", c->b_str);
+    {
+        size_t atoms_now = c->atoms, a0 = cp.base_atoms;
+        P("atoms added (array, hash, strings)", atoms_now > a0 ? atoms_now - a0 : 0);
+        att = c->code_alloc + c->pc2line + c->labels + c->jumps + c->srcloc + c->vars + c->scopes + c->globals + c->closure + c->cpool_arr +
+              c->cpool_str + c->source + c->fd_struct + c->resolve_out + c->b_header + c->b_cpool + c->b_vardefs + c->b_closure + c->b_code +
+              c->b_round + c->b_pc2line + c->b_source + c->b_str + (atoms_now > a0 ? atoms_now - a0 : 0);
+    }
+    other = delta > att ? delta - att : 0;
+    P("other (parser state, tokens, objects)", other);
+    L("cprof   %-34s %8ld B (the parse ended at +%ld B)", "(the heap before the compile)", (long)cp.base, (long)(cp.parse_end - cp.base));
+    if (cp_end_sample.valid) {
+        CPSample *e = &cp_end_sample;
+        L("cprof   after the compile, nothing else held: %ld functions finished, heap +%ld B: headers %ld, cpool %ld, vardefs %ld, closure vars %ld, code %ld, "
+          "rounding %ld, pc2line %ld, source copies %ld, strings %ld; atoms +%ld",
+          e->nfin, (long)(e->total - cp.base), (long)e->b_header, (long)e->b_cpool, (long)e->b_vardefs, (long)e->b_closure, (long)e->b_code, (long)e->b_round,
+          (long)e->b_pc2line, (long)e->b_source, (long)e->b_str, (long)(e->atoms > cp.base_atoms ? e->atoms - cp.base_atoms : 0));
+    }
+    (void)dummy;
+#undef P
+#undef L
+}
+#define CP_SAMPLE(ctx, where, out) cp_sample(ctx, where, out)
+#else
+#define CP_SAMPLE(ctx, where, out) ((void)0)
+#endif
+
 #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_*
 static const char *skip_lines(const char *p, int n) {
     while (p && n-- > 0 && *p) {
@@ -35803,6 +36226,7 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
        for another kind of access; the exception they threw is how it is known here */
     if (dbuf_error(&bc_out) || js_thrown_since(ctx, exc_before))
         goto oom;
+    CP_SAMPLE(ctx, "variables resolved", &bc_out);
     dbuf_free(&s->byte_code);
     s->byte_code = bc_out;
     return 0;
@@ -36966,6 +37390,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
         }
     }
 
+    CP_SAMPLE(ctx, "labels resolved", &bc_out);
     js_free(ctx, s->jump_slots);
     s->jump_slots = NULL;
     js_free(ctx, s->label_slots);
@@ -38663,6 +39088,11 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
     if (m != NULL)
         m->has_tla = fd->has_await;
 
+#ifdef MELT_COMPILE_PROFILE
+    if (cp.depth == 1) cp.root = fd;
+    cp.parse_end = ctx->rt->malloc_state.malloc_size;
+    CP_SAMPLE(ctx, "parse end", NULL);
+#endif
     /* create the function object and all the enclosed functions */
     fun_obj = js_create_function(ctx, fd);
     if (JS_IsException(fun_obj))
@@ -38706,8 +39136,20 @@ static JSValue JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
         JS_FreeValueRT(rt, ctx->error_back_trace);
         ctx->error_back_trace = JS_UNDEFINED;
     }
+#ifdef MELT_COMPILE_PROFILE
+    {
+        JSValue r;
+        cp_begin(ctx, input_len);
+        r = ctx->eval_internal(ctx, this_obj, input, input_len, filename, line, flags, scope_idx);
+        cp_end_sample.valid = 0;
+        if (!JS_IsException(r) && (flags & JS_EVAL_FLAG_COMPILE_ONLY)) cp_end(ctx, r);
+        cp_report(ctx, filename, !JS_IsException(r));
+        return r;
+    }
+#else
     return ctx->eval_internal(ctx, this_obj, input, input_len, filename, line,
                               flags, scope_idx);
+#endif
 }
 
 static JSValue JS_EvalObject(JSContext *ctx, JSValueConst this_obj,
@@ -41381,7 +41823,7 @@ static int js_bc_load_body(JSContext *ctx, JSFunctionBytecode *b)
     JSLazyBC *lz = b->lazy;
     JSBCFile *f = lz->file;
     BCReaderState ss, *s = &ss;
-    uint8_t *buf, *block;
+    uint8_t *buf = NULL, *block;
     size_t cpool_size, vardefs_size, size;
     int saved_len = b->byte_code_len;
     int ret = -1;
@@ -41394,12 +41836,15 @@ static int js_bc_load_body(JSContext *ctx, JSFunctionBytecode *b)
     buf = js_malloc(ctx, lz->len ? lz->len : 1);
     if (!buf)
         goto done;
+    /* Melt: a file that cannot be read or has changed is the storage's failure, not the script's, and the stub stays as it was (the
+       next call tries again): a plain error, which the page's code can catch and a timer survives.  InternalError is uncatchable
+       here, and one such error ended the whole callback and cancelled its interval. */
     if (js_bcfile_read(rt, f, (size_t)f->obj_base + lz->off, buf, lz->len)) {
-        JS_ThrowInternalError(ctx, "bytecode file unreadable");
+        JS_ThrowPlainError(ctx, "bytecode file unreadable");
         goto done;
     }
     if (bc_csum(buf, lz->len) != lz->csum) {
-        JS_ThrowInternalError(ctx, "bytecode file changed or corrupt");
+        JS_ThrowPlainError(ctx, "bytecode file changed or corrupt");
         goto done;
     }
     cpool_size = (size_t)b->cpool_count * sizeof(JSValue);
