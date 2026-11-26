@@ -1210,6 +1210,7 @@ struct JSObject {
     uint8_t is_uncatchable_error : 1; /* if true, error is not catchable */
     uint8_t tmp_mark : 1; /* used in JS_WriteObjectRec() */
     uint8_t is_HTMLDDA : 1; /* specific annex B IsHtmlDDA behavior */
+    uint8_t lazy_fn_props : 1; /* Melt: a bytecode function whose `length`, `name` and `prototype` are not in the shape yet: it has no property array until a property operation needs one (js_lazy_fn_materialize) */
     uint8_t has_weak_ref : 1; /* Melt: the object has weak references (WeakMap key, WeakRef target, ...): their list is in rt->weak_obj_hash */
     uint16_t class_id; /* see JS_CLASS_x */
     /* byte offsets: 16/24 */
@@ -6273,8 +6274,8 @@ static inline bool js_class_has_small_body(JSClassID class_id)
 
 /* 'props[]' is used to initialized the object properties. The number
    of elements depends on the shape. */
-static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID class_id,
-                                     JSProperty *props)
+static JSValue JS_NewObjectFromShape3(JSContext *ctx, JSShape *sh, JSClassID class_id,
+                                      JSProperty *props, bool lazy_fn)
 {
     JSObject *p;
     size_t obj_size;
@@ -6283,7 +6284,7 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
     /* Melt: a plain Object and a bound function use one pointer of u, so they do not pay for the 24 (64-bit) or 12 (32-bit)
        bytes the function and array members need (free_object has the same test) */
     obj_size = js_class_has_small_body(class_id) ? offsetof(JSObject, u) + sizeof(void *) : sizeof(JSObject);
-    js_trigger_gc(ctx->rt, obj_size + sizeof(JSProperty) * sh->prop_size);
+    js_trigger_gc(ctx->rt, obj_size + (lazy_fn ? 0 : sizeof(JSProperty) * sh->prop_size));
     p = js_malloc(ctx, obj_size);
     if (unlikely(!p))
         goto fail;
@@ -6298,10 +6299,12 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
     p->is_HTMLDDA = 0;
     p->is_prototype = 0;
     p->has_weak_ref = 0;
+    p->lazy_fn_props = lazy_fn;
     p->u.opaque = NULL;
     p->shape = sh;
-    p->prop = js_malloc(ctx, sizeof(JSProperty) * sh->prop_size);
-    if (unlikely(!p->prop)) {
+    /* Melt: a lazy function has no property array (the shape has no properties yet) */
+    p->prop = lazy_fn ? NULL : js_malloc(ctx, sizeof(JSProperty) * sh->prop_size);
+    if (unlikely(!p->prop && !lazy_fn)) {
         js_free(ctx, p);
     fail:
         if (props) {
@@ -6394,6 +6397,30 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
             p->prop[i] = props[i];
     }
     return JS_MKPTR(JS_TAG_OBJECT, p);
+}
+
+static inline JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID class_id,
+                                            JSProperty *props)
+{
+    return JS_NewObjectFromShape3(ctx, sh, class_id, props, false);
+}
+
+/* Melt: an empty function object of class `class_id` whose `length`, `name` and `prototype` are made on demand */
+static JSValue js_new_lazy_function_object(JSContext *ctx, JSClassID class_id)
+{
+    JSShape *sh;
+    JSObject *proto;
+
+    proto = JS_VALUE_GET_OBJ(ctx->class_proto[class_id]);
+    sh = find_hashed_shape_proto(ctx->rt, proto);
+    if (likely(sh)) {
+        sh = js_dup_shape(sh);
+    } else {
+        sh = js_new_shape(ctx, proto);
+        if (!sh)
+            return JS_EXCEPTION;
+    }
+    return JS_NewObjectFromShape3(ctx, sh, class_id, NULL, true);
 }
 
 /* WARNING: proto must be an object or JS_NULL */
@@ -6592,6 +6619,12 @@ static JSFunctionBytecode *JS_GetFunctionBytecode(JSValueConst val)
     return p->u.func.function_bytecode;
 }
 
+/* Melt: while a function is lazy and needs no home object, its `home_object` word is free and holds the atom that
+   SetFunctionName gave it (0: the bytecode's own name).  Everything else that reads `home_object` goes through this. */
+#define MELT_LAZY_NAME_IN_HOME(p) ((p)->lazy_fn_props && (p)->u.func.function_bytecode && !(p)->u.func.function_bytecode->need_home_object)
+#define MELT_LAZY_NAME(p) (MELT_LAZY_NAME_IN_HOME(p) ? (JSAtom)(uintptr_t)(p)->u.func.home_object : JS_ATOM_NULL)
+#define MELT_FN_HOME_OBJECT(p) (MELT_LAZY_NAME_IN_HOME(p) ? NULL : (p)->u.func.home_object)
+
 static void js_method_set_home_object(JSContext *ctx, JSValue func_obj,
                                       JSValue home_obj)
 {
@@ -6628,6 +6661,8 @@ static JSValue js_get_function_name(JSContext *ctx, JSAtom name)
     return name_str;
 }
 
+static bool js_lazy_fn_keep_name(JSContext *ctx, JSObject *p, JSAtom name);
+
 /* Modify the name of a method according to the atom and
    'flags'. 'flags' is a bitmask of JS_PROP_HAS_GET and
    JS_PROP_HAS_SET. Also set the home object of the method.
@@ -6637,6 +6672,14 @@ static int js_method_set_properties(JSContext *ctx, JSValue func_obj,
 {
     JSValue name_str;
 
+    /* Melt: a lazy function named by a plain method name keeps the atom (js_lazy_fn_keep_name) */
+    if (JS_VALUE_GET_TAG(func_obj) == JS_TAG_OBJECT &&
+        !(flags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET)) &&
+        name != JS_ATOM_NULL &&
+        js_lazy_fn_keep_name(ctx, JS_VALUE_GET_OBJ(func_obj), name)) {
+        js_method_set_home_object(ctx, func_obj, home_obj);
+        return 0;
+    }
     name_str = js_get_function_name(ctx, name);
     if (flags & JS_PROP_HAS_GET) {
         name_str = JS_ConcatString3(ctx, "get ", name_str, "");
@@ -6833,8 +6876,82 @@ static JSAutoInitIDEnum js_autoinit_get_id(JSProperty *pr)
     return pr->u.init.realm_and_id & 3;
 }
 
+/* Melt: lazy methods and accessors.  A method of a class or an object literal (and a getter or setter) is defined as an
+   auto-init property (JS_AUTOINIT_ID_BYTECODE with a pointer as the opaque value: the builtins' values are small integers)
+   and its function object is made when the property is first read.  The opaque value is the method's function bytecode
+   when it captures no variable (tag 0), else a JSLazyFn with the tag 1 (a method) or 2 (an accessor: the getter's and the
+   setter's functions, one property).  The closures' variables are captured when the property is defined (the defining frame
+   is gone by the time of the first read); the home object is the object that holds the property. */
+typedef struct JSLazyFn {
+    JSFunctionBytecode *b[2];   /* the method, or the getter and the setter (NULL: not defined) */
+    JSVarRef *var_refs[];       /* the variables b[0] captures, then those of b[1] */
+} JSLazyFn;
+#define JS_LAZY_MIN 64          /* opaque values below this are JS_BUILTIN_x */
+#define JS_LAZY_TAG_METHOD 1
+#define JS_LAZY_TAG_ACCESSOR 2
+#define JS_LAZY_TAG_FACTORY 3   /* the opaque value is a function object: JS_DefineLazyProperty */
+
+static bool js_autoinit_is_lazy(JSProperty *pr)
+{
+    return js_autoinit_get_id(pr) == JS_AUTOINIT_ID_BYTECODE &&
+        (uintptr_t)pr->u.init.opaque >= JS_LAZY_MIN;
+}
+
+static bool js_autoinit_is_lazy_accessor(JSProperty *pr)
+{
+    return js_autoinit_is_lazy(pr) &&
+        ((uintptr_t)pr->u.init.opaque & 3) == JS_LAZY_TAG_ACCESSOR;
+}
+
+static bool js_autoinit_is_lazy_factory(JSProperty *pr)
+{
+    return js_autoinit_is_lazy(pr) &&
+        ((uintptr_t)pr->u.init.opaque & 3) == JS_LAZY_TAG_FACTORY;
+}
+
+static inline int js_lazy_nvars(JSFunctionBytecode *b)
+{
+    return b ? b->closure_var_count : 0;
+}
+
+/* the record of a lazy property, or NULL for a method that captures nothing (whose bytecode is *pb0) */
+static JSLazyFn *js_lazy_get(void *opaque, JSFunctionBytecode **pb0)
+{
+    uintptr_t o = (uintptr_t)opaque;
+    if (o & 3) {
+        JSLazyFn *m = (JSLazyFn *)(o & ~(uintptr_t)3);
+        *pb0 = m->b[0];
+        return m;
+    }
+    *pb0 = (JSFunctionBytecode *)o;
+    return NULL;
+}
+
+static void js_lazy_free(JSRuntime *rt, void *opaque)
+{
+    JSFunctionBytecode *b0;
+    JSLazyFn *m;
+    if (((uintptr_t)opaque & 3) == JS_LAZY_TAG_FACTORY) {
+        JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_OBJECT, (JSObject *)((uintptr_t)opaque & ~(uintptr_t)3)));
+        return;
+    }
+    m = js_lazy_get(opaque, &b0);
+    if (m) {
+        int i, n = js_lazy_nvars(m->b[0]) + js_lazy_nvars(m->b[1]);
+        for(i = 0; i < n; i++)
+            free_var_ref(rt, m->var_refs[i]);
+        if (m->b[1])
+            JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, m->b[1]));
+        js_free_rt(rt, m);
+    }
+    if (b0)
+        JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, b0));
+}
+
 static void js_autoinit_free(JSRuntime *rt, JSProperty *pr)
 {
+    if (unlikely(js_autoinit_is_lazy(pr)))
+        js_lazy_free(rt, pr->u.init.opaque);
     JS_FreeContext(js_autoinit_get_realm(pr));
 }
 
@@ -6842,6 +6959,24 @@ static void js_autoinit_mark(JSRuntime *rt, JSProperty *pr,
                              JS_MarkFunc *mark_func)
 {
     mark_func(rt, &js_autoinit_get_realm(pr)->header);
+    if (unlikely(js_autoinit_is_lazy_factory(pr))) {
+        mark_func(rt, &((JSObject *)((uintptr_t)pr->u.init.opaque & ~(uintptr_t)3))->header);
+    } else if (unlikely(js_autoinit_is_lazy(pr))) {
+        JSFunctionBytecode *b0;
+        JSLazyFn *m = js_lazy_get(pr->u.init.opaque, &b0);
+        if (m) {
+            int i, n = js_lazy_nvars(m->b[0]) + js_lazy_nvars(m->b[1]);
+            for(i = 0; i < n; i++) {
+                JSVarRef *var_ref = m->var_refs[i];
+                if (var_ref && (var_ref->is_detached || var_ref->is_coro))
+                    mark_func(rt, &var_ref->header);
+            }
+            if (m->b[1])
+                mark_func(rt, &m->b[1]->header);
+        }
+        if (b0)
+            mark_func(rt, &b0->header);
+    }
 }
 
 typedef struct JSCClosureRecord {
@@ -6958,11 +7093,18 @@ static void free_property(JSRuntime *rt, JSProperty *pr, int prop_flags)
     }
 }
 
+/* Melt: a function object made by js_closure carries no `length`, `name` or `prototype` slots until something looks at one of them
+   (or adds any property, so that they stay first in the shape's order); this adds them, with the values js_closure used to. */
+static int js_lazy_fn_materialize(JSObject *p);
+#define MELT_LAZY_FN_ATOM(atom) ((atom) == JS_ATOM_length || (atom) == JS_ATOM_name || (atom) == JS_ATOM_prototype)
+
 static inline JSShapeProperty *find_own_property1(JSObject *p, JSAtom atom)
 {
     JSShape *sh;
     JSShapeProperty *pr, *prop;
     intptr_t h;
+    if (unlikely(p->lazy_fn_props) && MELT_LAZY_FN_ATOM(atom))
+        js_lazy_fn_materialize(p);
     sh = p->shape;
     h = hash_atom(atom, sh->prop_hash_mask);
     h = prop_hash_end(sh)[-h - 1];
@@ -6984,6 +7126,8 @@ static inline JSShapeProperty *find_own_property(JSProperty **ppr,
     JSShape *sh;
     JSShapeProperty *pr, *prop;
     intptr_t h;
+    if (unlikely(p->lazy_fn_props) && MELT_LAZY_FN_ATOM(atom))
+        js_lazy_fn_materialize(p);
     sh = p->shape;
     h = hash_atom(atom, sh->prop_hash_mask);
     h = prop_hash_end(sh)[-h - 1];
@@ -7103,7 +7247,9 @@ static void js_bytecode_function_finalizer(JSRuntime *rt, JSValueConst val)
     int i;
 
     p1 = p->u.func.home_object;
-    if (p1) {
+    if (MELT_LAZY_NAME_IN_HOME(p)) {
+        JS_FreeAtomRT(rt, (JSAtom)(uintptr_t)p1);
+    } else if (p1) {
         JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_OBJECT, p1));
     }
     b = p->u.func.function_bytecode;
@@ -7126,7 +7272,7 @@ static void js_bytecode_function_mark(JSRuntime *rt, JSValueConst val,
     JSFunctionBytecode *b = p->u.func.function_bytecode;
     int i;
 
-    if (p->u.func.home_object) {
+    if (MELT_FN_HOME_OBJECT(p)) {
         JS_MarkValue(rt, JS_MKPTR(JS_TAG_OBJECT, p->u.func.home_object),
                      mark_func);
     }
@@ -7850,6 +7996,8 @@ void JS_MeltDeepCensus(JSRuntime *rt, void (*sink)(const char *line))
     size_t stub_cv = 0, stub_vd = 0;
     long stub_cvn = 0;
     long n_proto_mat = 0;
+    long n_acc_fn = 0, n_acc_unl = 0, n_lazym = 0, n_lazym_rec = 0;
+    size_t b_acc_fn = 0, b_lazym = 0;
     size_t total_seen;
 #define L(...) do { snprintf(ln, sizeof ln, __VA_ARGS__); sink(ln); } while (0)
 #define BLK(p) ((p) ? js_malloc_usable_size_rt(rt, (p)) + MALLOC_OVERHEAD : (size_t)0)
@@ -7893,9 +8041,25 @@ void JS_MeltDeepCensus(JSRuntime *rt, void (*sink)(const char *line))
                 if (prs[k].atom == JS_ATOM_NULL) continue;
                 switch (prs[k].flags & JS_PROP_TMASK) {
                 case JS_PROP_NORMAL: t_norm++; break;
-                case JS_PROP_GETSET: t_getset++; break;
+                case JS_PROP_GETSET: {
+                    JSObject *h[2]; int hi;
+                    t_getset++;
+                    h[0] = p->prop[k].u.getset.getter; h[1] = p->prop[k].u.getset.setter;
+                    for (hi = 0; hi < 2; hi++)
+                        if (h[hi] && js_class_has_bytecode(h[hi]->class_id)) {
+                            n_acc_fn++; b_acc_fn += BLK(h[hi]) + BLK(h[hi]->prop) + BLK(h[hi]->u.func.var_refs);
+                            if (JS_BC_UNLOADED(h[hi]->u.func.function_bytecode)) n_acc_unl++;
+                        }
+                    break; }
                 case JS_PROP_VARREF: t_varref++; break;
-                default: t_auto++; break;
+                default:
+                    t_auto++;
+                    if (js_autoinit_is_lazy(&p->prop[k]) && !js_autoinit_is_lazy_factory(&p->prop[k])) {
+                        void *o = p->prop[k].u.init.opaque;
+                        n_lazym++;
+                        if ((uintptr_t)o & 3) { n_lazym_rec++; b_lazym += BLK((void *)((uintptr_t)o & ~(uintptr_t)3)); }
+                    }
+                    break;
                 }
             }
             if (p->class_id == JS_CLASS_ARRAY || p->class_id == JS_CLASS_ARGUMENTS) {
@@ -7988,6 +8152,8 @@ void JS_MeltDeepCensus(JSRuntime *rt, void (*sink)(const char *line))
     FN("JS function objects", fn_all);
     FN("  of them never called (body not loaded)", fn_unl);
     FN("C function objects", fn_c);
+    L("dcensus: accessor halves that are JS functions %ld (%ld never called): %ld B of bodies, property arrays and closure arrays; lazy methods (a closure made on first read) %ld, %ld with a variable record (%ld B)",
+      n_acc_fn, n_acc_unl, (long)b_acc_fn, n_lazym, n_lazym_rec, (long)b_lazym);
     L("dcensus: materialised default prototype objects %ld (%ld B of bodies, %ld B of property arrays)", n_proto_mat, (long)b_proto_obj, (long)b_proto_props);
     for (i = 0; i < nc; i++) {
         if (cls[i].n >= 10 || cls[i].body + cls[i].props >= 1024) {
@@ -8587,6 +8753,13 @@ static const char *get_func_name(JSContext *ctx, JSValueConst func)
 
     if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT)
         return NULL;
+    if (JS_VALUE_GET_OBJ(func)->lazy_fn_props) {
+        /* Melt: no property to read (and no allocation while a stack trace is built): the name is the bytecode's */
+        JSAtom a = MELT_LAZY_NAME(JS_VALUE_GET_OBJ(func));
+        if (a == JS_ATOM_NULL)
+            a = JS_VALUE_GET_OBJ(func)->u.func.function_bytecode->func_name;
+        return JS_AtomToCString(ctx, a != JS_ATOM_NULL ? a : JS_ATOM_empty_string);
+    }
     prs = find_own_property(&pr, JS_VALUE_GET_OBJ(func), JS_ATOM_name);
     if (!prs)
         return NULL;
@@ -9454,9 +9627,16 @@ static JSValue js_bytecode_eval(JSContext *ctx, const uint8_t *bytecode,
     return result;
 }
 
+static int js_lazy_factory_init(JSContext *ctx, JSObject *p, JSAtom prop, JSProperty *pr, JSShapeProperty *prs);
+static JSValue js_lazy_method_init(JSContext *ctx, JSObject *p, JSAtom atom, void *opaque);
+static int js_lazy_accessor_init(JSContext *ctx, JSObject *p, JSAtom atom, void *opaque,
+                                 JSObject **pgetter, JSObject **psetter);
+
 static JSValue js_bytecode_autoinit(JSContext *ctx, JSObject *p, JSAtom atom,
                                     void *opaque)
 {
+    if ((uintptr_t)opaque >= JS_LAZY_MIN)    /* Melt: a lazy method */
+        return js_lazy_method_init(ctx, p, atom, opaque);
     switch ((uintptr_t)opaque) {
     default:
         abort();
@@ -9542,10 +9722,22 @@ static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
     JSContext *realm;
     JSAutoInitFunc *func;
 
+    if (unlikely(js_autoinit_is_lazy_factory(pr)))   /* Melt: JS code runs, so the property is found again after it */
+        return js_lazy_factory_init(ctx, p, prop, pr, prs);
     if (js_shape_prepare_update(ctx, p, &prs))
         return -1;
 
     realm = js_autoinit_get_realm(pr);
+    if (unlikely(js_autoinit_is_lazy_accessor(pr))) {
+        /* Melt: a lazy accessor becomes an accessor property */
+        JSObject *getter, *setter;
+        int ret = js_lazy_accessor_init(realm, p, prop, pr->u.init.opaque, &getter, &setter);
+        js_autoinit_free(ctx->rt, pr);
+        prs->flags = (prs->flags & ~JS_PROP_TMASK) | JS_PROP_GETSET;
+        pr->u.getset.getter = getter;
+        pr->u.getset.setter = setter;
+        return ret;
+    }
     func = js_autoinit_func_table[js_autoinit_get_id(pr)];
     /* 'func' shall not modify the object properties 'pr' */
     val = func(realm, p, prop, pr->u.init.opaque);
@@ -9897,7 +10089,7 @@ static int JS_CheckBrand(JSContext *ctx, JSValue obj, JSValue func)
     p1 = JS_VALUE_GET_OBJ(func);
     if (!js_class_has_bytecode(p1->class_id))
         goto not_obj;
-    home_obj = p1->u.func.home_object;
+    home_obj = MELT_FN_HOME_OBJECT(p1);
     if (!home_obj)
         goto not_obj;
     prs = find_own_property(&pr, home_obj, JS_ATOM_Private_brand);
@@ -9986,6 +10178,9 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
     /* clear pointer for consistency in case of failure */
     *ptab = NULL;
     *plen = 0;
+
+    if (unlikely(p->lazy_fn_props) && js_lazy_fn_materialize(p))
+        return -1;
 
     /* compute the number of returned properties */
     num_keys_count = 0;
@@ -10610,6 +10805,8 @@ static JSProperty *add_property(JSContext *ctx,
 {
     JSShape *sh, *new_sh;
 
+    if (unlikely(p->lazy_fn_props) && js_lazy_fn_materialize(p))
+        return NULL;
     if (unlikely(p->is_prototype)) {
         /* track addition of small integer properties to
            Array.prototype and Object.prototype */
@@ -10714,6 +10911,8 @@ static int delete_property(JSContext *ctx, JSObject *p, JSAtom atom)
     intptr_t h, h1;
 
  redo:
+    if (unlikely(p->lazy_fn_props) && MELT_LAZY_FN_ATOM(atom))
+        js_lazy_fn_materialize(p);
     sh = p->shape;
     h1 = hash_atom(atom, sh->prop_hash_mask);
     h = prop_hash_end(sh)[-h1 - 1];
@@ -12097,6 +12296,13 @@ static bool js_object_has_name(JSContext *ctx, JSValue obj)
     JSValue val;
     JSString *p;
 
+    if (JS_VALUE_GET_OBJ(obj)->lazy_fn_props) {
+        /* Melt: the name a lazy function would get (js_lazy_fn_materialize) */
+        JSAtom a = MELT_LAZY_NAME(JS_VALUE_GET_OBJ(obj));
+        if (a == JS_ATOM_NULL)
+            a = JS_VALUE_GET_OBJ(obj)->u.func.function_bytecode->func_name;
+        return a != JS_ATOM_NULL && a != JS_ATOM_empty_string;
+    }
     prs = find_own_property(&pr, JS_VALUE_GET_OBJ(obj), JS_ATOM_name);
     if (!prs)
         return false;
@@ -12109,9 +12315,25 @@ static bool js_object_has_name(JSContext *ctx, JSValue obj)
     return (p->len != 0);
 }
 
+/* Melt: SetFunctionName with a plain atom on a lazy function that has no home object: the atom is kept in the object's free
+   `home_object` word and becomes the `name` property when the properties are made (js_lazy_fn_materialize). */
+static bool js_lazy_fn_keep_name(JSContext *ctx, JSObject *p, JSAtom name)
+{
+    if (!MELT_LAZY_NAME_IN_HOME(p) || name == JS_ATOM_NULL ||
+        JS_AtomGetKind(ctx, name) != JS_ATOM_KIND_STRING)
+        return false;
+    JS_FreeAtom(ctx, MELT_LAZY_NAME(p));
+    p->u.func.home_object = (JSObject *)(uintptr_t)JS_DupAtom(ctx, name);
+    return true;
+}
+
 static int JS_DefineObjectName(JSContext *ctx, JSValue obj,
                                JSAtom name, int flags)
 {
+    if (name != JS_ATOM_NULL && JS_IsObject(obj) && !js_object_has_name(ctx, obj) &&
+        flags == JS_PROP_CONFIGURABLE &&
+        js_lazy_fn_keep_name(ctx, JS_VALUE_GET_OBJ(obj), name))
+        return 0;
     if (name != JS_ATOM_NULL
     &&  JS_IsObject(obj)
     &&  !js_object_has_name(ctx, obj)
@@ -15325,7 +15547,7 @@ static __maybe_unused void JS_DumpObject(JSRuntime *rt, JSObject *p)
                 printf(" ");
                 JS_DumpValue(rt, var_refs[i]->value);
             }
-            if (p->u.func.home_object) {
+            if (MELT_FN_HOME_OBJECT(p)) {
                 printf(" HomeObject: ");
                 JS_DumpValue(rt, JS_MKPTR(JS_TAG_OBJECT, p->u.func.home_object));
             }
@@ -18036,6 +18258,33 @@ static JSVarRef *get_var_ref(JSContext *ctx, JSStackFrame *sf, int var_idx,
     }
 }
 
+/* a new reference to the variable that closure variable 'cv' of a function being defined in frame 'sf' captures */
+static JSVarRef *js_closure_capture(JSContext *ctx, JSClosureVar *cv,
+                                    JSVarRef **cur_var_refs, JSStackFrame *sf)
+{
+    JSVarRef *var_ref;
+    switch(cv->closure_type) {
+    case JS_CLOSURE_LOCAL:
+        /* reuse the existing variable reference if it already exists */
+        var_ref = get_var_ref(ctx, sf, cv->var_idx, false);
+        break;
+    case JS_CLOSURE_ARG:
+        /* reuse the existing variable reference if it already exists */
+        var_ref = get_var_ref(ctx, sf, cv->var_idx, true);
+        break;
+    case JS_CLOSURE_REF:
+    case JS_CLOSURE_GLOBAL_REF:
+        var_ref = cur_var_refs[cv->var_idx];
+        JS_REF_COUNT(var_ref)++;
+        break;
+    default:
+        abort();
+    }
+    return var_ref;
+}
+
+/* Melt: with sf == NULL, cur_var_refs is the function's own, complete variable array (a lazy method's,
+   JSLazyMethod): its references are taken as they are */
 static JSValue js_closure2(JSContext *ctx, JSValue func_obj,
                            JSFunctionBytecode *b,
                            JSVarRef **cur_var_refs,
@@ -18055,24 +18304,12 @@ static JSValue js_closure2(JSContext *ctx, JSValue func_obj,
             goto fail;
         p->u.func.var_refs = var_refs;
         for(i = 0; i < b->closure_var_count; i++) {
-            JSClosureVar *cv = &b->closure_var[i];
             JSVarRef *var_ref;
-            switch(cv->closure_type) {
-            case JS_CLOSURE_LOCAL:
-                /* reuse the existing variable reference if it already exists */
-                var_ref = get_var_ref(ctx, sf, cv->var_idx, false);
-                break;
-            case JS_CLOSURE_ARG:
-                /* reuse the existing variable reference if it already exists */
-                var_ref = get_var_ref(ctx, sf, cv->var_idx, true);
-                break;
-            case JS_CLOSURE_REF:
-            case JS_CLOSURE_GLOBAL_REF:
-                var_ref = cur_var_refs[cv->var_idx];
+            if (!sf) {
+                var_ref = cur_var_refs[i];
                 JS_REF_COUNT(var_ref)++;
-                break;
-            default:
-                abort();
+            } else {
+                var_ref = js_closure_capture(ctx, &b->closure_var[i], cur_var_refs, sf);
             }
             if (!var_ref)
                 goto fail;
@@ -18105,6 +18342,40 @@ static JSValue js_instantiate_prototype(JSContext *ctx, JSObject *p, JSAtom atom
     return obj;
 }
 
+/* Melt: give a lazy function object (js_closure) the properties it was made without, in the order a plain
+   js_closure would have: `length`, `name`, then `prototype` as an auto-init property for a constructor.  The values come from
+   the bytecode; the object's own shape is empty until now.  Returns -1 (exception pending, object still lazy) when the
+   property array cannot be allocated. */
+static int js_lazy_fn_materialize(JSObject *p)
+{
+    JSFunctionBytecode *b = p->u.func.function_bytecode;
+    JSContext *ctx = b->realm;
+    JSValue func_obj = JS_MKPTR(JS_TAG_OBJECT, p);
+    JSAtom name_atom;
+    bool extensible = p->extensible;
+
+    p->prop = js_malloc(ctx, sizeof(JSProperty) * p->shape->prop_size);
+    if (!p->prop)
+        return -1;
+    name_atom = MELT_LAZY_NAME(p);
+    if (name_atom != JS_ATOM_NULL) {
+        /* the word's atom reference moves to the local: the word is a home object (none) again */
+        p->u.func.home_object = NULL;
+    } else {
+        name_atom = JS_DupAtom(ctx, b->func_name == JS_ATOM_NULL ? JS_ATOM_empty_string : b->func_name);
+    }
+    p->lazy_fn_props = 0;
+    p->extensible = true; /* the properties were there before Object.preventExtensions */
+    js_function_set_properties(ctx, func_obj, name_atom, b->defined_arg_count);
+    JS_FreeAtom(ctx, name_atom);
+    if (b->has_prototype)
+        JS_DefineAutoInitProperty(ctx, func_obj, JS_ATOM_prototype,
+                                  JS_AUTOINIT_ID_PROTOTYPE, NULL,
+                                  JS_PROP_WRITABLE);
+    p->extensible = extensible;
+    return 0;
+}
+
 static const uint16_t func_kind_to_class_id[] = {
     [JS_FUNC_NORMAL] = JS_CLASS_BYTECODE_FUNCTION,
     [JS_FUNC_GENERATOR] = JS_CLASS_GENERATOR_FUNCTION,
@@ -18119,9 +18390,16 @@ static JSValue js_closure(JSContext *ctx, JSValue bfunc,
     JSFunctionBytecode *b;
     JSValue func_obj;
     JSAtom name_atom;
+    bool lazy;
 
     b = JS_VALUE_GET_PTR(bfunc);
-    func_obj = JS_NewObjectClass(ctx, func_kind_to_class_id[b->func_kind]);
+    /* Melt: `length`, `name` and (for a constructor) `prototype` of a function that is not a generator are made when a
+       property operation first needs them (js_lazy_fn_materialize) */
+    lazy = !(b->func_kind & JS_FUNC_GENERATOR) && b->realm;
+    if (lazy)
+        func_obj = js_new_lazy_function_object(ctx, func_kind_to_class_id[b->func_kind]);
+    else
+        func_obj = JS_NewObjectClass(ctx, func_kind_to_class_id[b->func_kind]);
     if (JS_IsException(func_obj)) {
         JS_FreeValue(ctx, bfunc);
         return JS_EXCEPTION;
@@ -18130,6 +18408,11 @@ static JSValue js_closure(JSContext *ctx, JSValue bfunc,
     if (JS_IsException(func_obj)) {
         /* bfunc has been freed */
         goto fail;
+    }
+    if (lazy) {
+        if (b->has_prototype)
+            JS_SetConstructorBit(ctx, func_obj, true);
+        return func_obj;
     }
     name_atom = b->func_name;
     if (name_atom == JS_ATOM_NULL)
@@ -18165,6 +18448,277 @@ static JSValue js_closure(JSContext *ctx, JSValue bfunc,
     /* bfunc is freed when func_obj is freed */
     JS_FreeValue(ctx, func_obj);
     return JS_EXCEPTION;
+}
+
+#define OP_DEFINE_METHOD_METHOD 0
+#define OP_DEFINE_METHOD_GETTER 1
+#define OP_DEFINE_METHOD_SETTER 2
+#define OP_DEFINE_METHOD_ENUMERABLE 4
+
+/* Melt: the function object of a lazy method or accessor half, made when its property is first read */
+static JSValue js_lazy_make(JSContext *ctx, JSObject *p, JSAtom atom,
+                            JSFunctionBytecode *b, JSVarRef **var_refs, int flags)
+{
+    JSValue func_obj;
+
+    func_obj = js_closure(ctx, js_dup(JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, b)),
+                          var_refs, NULL);
+    if (JS_IsException(func_obj))
+        return JS_EXCEPTION;
+    if (js_method_set_properties(ctx, func_obj, atom, flags,
+                                 JS_MKPTR(JS_TAG_OBJECT, p)) < 0) {
+        JS_FreeValue(ctx, func_obj);
+        return JS_EXCEPTION;
+    }
+    return func_obj;
+}
+
+static JSValue js_lazy_method_init(JSContext *ctx, JSObject *p, JSAtom atom, void *opaque)
+{
+    JSFunctionBytecode *b;
+    JSLazyFn *m = js_lazy_get(opaque, &b);
+    return js_lazy_make(ctx, p, atom, b, m ? m->var_refs : NULL, 0);
+}
+
+static int js_lazy_accessor_init(JSContext *ctx, JSObject *p, JSAtom atom, void *opaque,
+                                 JSObject **pgetter, JSObject **psetter)
+{
+    JSFunctionBytecode *b0;
+    JSLazyFn *m = js_lazy_get(opaque, &b0);
+    JSValue v;
+
+    *pgetter = *psetter = NULL;
+    if (m->b[0]) {
+        v = js_lazy_make(ctx, p, atom, m->b[0], m->var_refs, JS_PROP_HAS_GET);
+        if (JS_IsException(v))
+            return -1;
+        *pgetter = JS_VALUE_GET_OBJ(v);
+    }
+    if (m->b[1]) {
+        v = js_lazy_make(ctx, p, atom, m->b[1], m->var_refs + js_lazy_nvars(m->b[0]), JS_PROP_HAS_SET);
+        if (JS_IsException(v))
+            return -1;
+        *psetter = JS_VALUE_GET_OBJ(v);
+    }
+    return 0;
+}
+
+/* Melt: OP_fclosure followed by OP_define_method (a method, getter or setter of a class or an object literal, not
+   computed): defines the property with the closure still to be made, instead of the function object.  The closure's
+   variables are captured now.  A getter and a setter of one name (in either order) share the property.  Returns 1 when it
+   did, 0 when the caller must define the method as before (the property exists, an integer name, an exotic object), -1 on
+   an exception.  'func' is the function bytecode (borrowed). */
+static int js_define_lazy_method(JSContext *ctx, JSValueConst obj, JSAtom atom,
+                                 int op_flags, JSValueConst func,
+                                 JSVarRef **cur_var_refs, JSStackFrame *sf)
+{
+    JSObject *p;
+    JSProperty *pr;
+    JSShapeProperty *prs;
+    JSFunctionBytecode *b, *b0;
+    JSLazyFn *m = NULL, *old = NULL;
+    int i, kind, half, flags, nv_new, n0, n1, nv;
+
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
+        return 0;
+    p = JS_VALUE_GET_OBJ(obj);
+    if ((p->class_id != JS_CLASS_OBJECT && p->class_id != JS_CLASS_BYTECODE_FUNCTION) ||
+        !p->extensible || p->is_exotic || __JS_AtomIsTaggedInt(atom))
+        return 0;
+    kind = op_flags & 3;
+    half = (kind == OP_DEFINE_METHOD_SETTER);
+    flags = JS_PROP_CONFIGURABLE;
+    if (kind == OP_DEFINE_METHOD_METHOD)
+        flags |= JS_PROP_WRITABLE;
+    if (op_flags & OP_DEFINE_METHOD_ENUMERABLE)
+        flags |= JS_PROP_ENUMERABLE;
+    b = JS_VALUE_GET_PTR(func);
+    nv_new = b->closure_var_count;
+    prs = find_own_property(&pr, p, atom);
+    if (prs) {
+        /* only the other half of a lazy accessor of the same kind is merged */
+        if (kind == OP_DEFINE_METHOD_METHOD ||
+            (prs->flags & (JS_PROP_TMASK | JS_PROP_C_W_E)) != (JS_PROP_AUTOINIT | flags) ||
+            !js_autoinit_is_lazy_accessor(pr))
+            return 0;
+        old = js_lazy_get(pr->u.init.opaque, &b0);
+        if (old->b[half])
+            return 0;
+    }
+    if (!old && kind == OP_DEFINE_METHOD_METHOD && nv_new == 0) {
+        /* a method that captures nothing: the bytecode is the whole record */
+        JS_DupValue(ctx, func);
+        if (JS_DefineAutoInitProperty(ctx, obj, atom, JS_AUTOINIT_ID_BYTECODE, b, flags) < 0) {
+            JS_FreeValue(ctx, func);
+            return -1;
+        }
+        return 1;
+    }
+    n0 = half ? js_lazy_nvars(old ? old->b[0] : NULL) : nv_new;
+    n1 = half ? nv_new : js_lazy_nvars(old ? old->b[1] : NULL);
+    nv = n0 + n1;
+    m = js_malloc(ctx, sizeof(*m) + sizeof(m->var_refs[0]) * nv);
+    if (!m)
+        return -1;
+    for(i = 0; i < nv_new; i++) {
+        JSVarRef **slot = &m->var_refs[(half ? n0 : 0) + i];
+        *slot = js_closure_capture(ctx, &b->closure_var[i], cur_var_refs, sf);
+        if (!*slot) {
+            while (--i >= 0)
+                free_var_ref(ctx->rt, m->var_refs[(half ? n0 : 0) + i]);
+            js_free(ctx, m);
+            return -1;
+        }
+    }
+    JS_DupValue(ctx, func);     /* the property's reference to the bytecode */
+    m->b[0] = m->b[1] = NULL;
+    m->b[half] = b;
+    if (old) {
+        /* the old half's references move to the new record */
+        m->b[!half] = old->b[!half];
+        for(i = 0; i < nv - nv_new; i++)
+            m->var_refs[(half ? 0 : nv_new) + i] = old->var_refs[i];
+        pr->u.init.opaque = (void *)((uintptr_t)m | JS_LAZY_TAG_ACCESSOR);
+        js_free(ctx, old);
+        return 1;
+    }
+    {
+        void *opaque = (void *)((uintptr_t)m | (kind == OP_DEFINE_METHOD_METHOD ?
+                                                JS_LAZY_TAG_METHOD : JS_LAZY_TAG_ACCESSOR));
+        if (JS_DefineAutoInitProperty(ctx, obj, atom, JS_AUTOINIT_ID_BYTECODE, opaque, flags) < 0) {
+            js_lazy_free(ctx->rt, opaque);
+            return -1;
+        }
+    }
+    return 1;
+}
+
+/* Melt: calls the factory of a lazy property with the property's name, the holder as 'this'.  A data property's value is
+   what it returns; an accessor's functions are the 'get' and 'set' properties of what it returns (a function or
+   undefined). */
+static int js_lazy_factory_call(JSContext *ctx, JSObject *p, JSAtom prop, JSObject *factory, bool accessor,
+                                JSValue *pval, JSObject **pgetter, JSObject **psetter)
+{
+    JSValue key, res, v;
+    JSAtom names[2] = { JS_ATOM_get, JS_ATOM_set };
+    JSObject **out[2] = { pgetter, psetter };
+    int i;
+
+    *pval = JS_UNDEFINED;
+    *pgetter = *psetter = NULL;
+    key = JS_AtomToValue(ctx, prop);
+    if (JS_IsException(key))
+        return -1;
+    res = JS_Call(ctx, JS_MKPTR(JS_TAG_OBJECT, factory), JS_MKPTR(JS_TAG_OBJECT, p), 1, (JSValueConst *)&key);
+    JS_FreeValue(ctx, key);
+    if (JS_IsException(res))
+        return -1;
+    if (!accessor) {
+        *pval = res;
+        return 0;
+    }
+    for(i = 0; i < 2; i++) {
+        v = JS_GetProperty(ctx, res, names[i]);
+        if (JS_IsException(v)) {
+            JS_FreeValue(ctx, res);
+            if (*pgetter) JS_FreeValue(ctx, JS_MKPTR(JS_TAG_OBJECT, *pgetter));
+            *pgetter = NULL;
+            return -1;
+        }
+        if (JS_IsFunction(ctx, v))
+            *out[i] = JS_VALUE_GET_OBJ(v);
+        else
+            JS_FreeValue(ctx, v);
+    }
+    JS_FreeValue(ctx, res);
+    return 0;
+}
+
+static void js_lazy_factory_discard(JSContext *ctx, JSValue val, JSObject *getter, JSObject *setter)
+{
+    JS_FreeValue(ctx, val);
+    if (getter) JS_FreeValue(ctx, JS_MKPTR(JS_TAG_OBJECT, getter));
+    if (setter) JS_FreeValue(ctx, JS_MKPTR(JS_TAG_OBJECT, setter));
+}
+
+/* the first read of a property defined by JS_DefineLazyProperty */
+static int js_lazy_factory_init(JSContext *ctx, JSObject *p, JSAtom prop, JSProperty *pr, JSShapeProperty *prs)
+{
+    void *opaque = pr->u.init.opaque;
+    JSObject *factory = (JSObject *)((uintptr_t)opaque & ~(uintptr_t)3);
+    JSContext *realm = js_autoinit_get_realm(pr);
+    bool accessor = !(prs->flags & JS_PROP_WRITABLE);
+    JSValue val;
+    JSObject *getter, *setter;
+    int ret;
+
+    /* the factory may run any code: keep it alive, and find the property again afterwards */
+    JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, factory));
+    ret = js_lazy_factory_call(realm, p, prop, factory, accessor, &val, &getter, &setter);
+    JS_FreeValue(ctx, JS_MKPTR(JS_TAG_OBJECT, factory));
+    if (ret < 0)
+        return -1;      /* the property stays as it was: the next read calls the factory again */
+    prs = find_own_property(&pr, p, prop);
+    if (!prs || (prs->flags & JS_PROP_TMASK) != JS_PROP_AUTOINIT || pr->u.init.opaque != opaque) {
+        js_lazy_factory_discard(ctx, val, getter, setter);  /* the factory itself defined or read it */
+        return 0;
+    }
+    if (js_shape_prepare_update(ctx, p, &prs)) {
+        js_lazy_factory_discard(ctx, val, getter, setter);
+        return -1;
+    }
+    js_autoinit_free(ctx->rt, pr);
+    if (accessor) {
+        prs->flags = (prs->flags & ~JS_PROP_TMASK) | JS_PROP_GETSET;
+        pr->u.getset.getter = getter;
+        pr->u.getset.setter = setter;
+    } else {
+        prs->flags &= ~JS_PROP_TMASK;
+        pr->u.value = val;
+    }
+    return 0;
+}
+
+/* Melt: defines a property whose value (or getter and setter) is made by calling 'factory' with the property's name on its
+   first read, instead of holding the functions that make it from the start.  One factory serves any number of properties.
+   flags: JS_PROP_CONFIGURABLE, JS_PROP_ENUMERABLE, and JS_PROP_GETSET for an accessor (then the factory returns an object whose
+   'get' and 'set' are the functions); else a writable data property, the factory returning the value.  The factory runs while
+   the property is read, defined or enumerated with its descriptor, so it must only make values (not touch the holder's
+   properties).  An existing property, or an object that is not ordinary, is defined at once. */
+int JS_DefineLazyProperty(JSContext *ctx, JSValueConst obj, JSAtom prop, JSValueConst factory, int flags)
+{
+    JSObject *p, *fp;
+    JSProperty *pr;
+    bool accessor = (flags & JS_PROP_GETSET) != 0;
+
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT || !JS_IsFunction(ctx, factory)) {
+        JS_ThrowTypeError(ctx, "not an object or a function");
+        return -1;
+    }
+    p = JS_VALUE_GET_OBJ(obj);
+    flags &= JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE;
+    if (!accessor)
+        flags |= JS_PROP_WRITABLE;
+    if (p->is_exotic || !p->extensible || __JS_AtomIsTaggedInt(prop) || find_own_property(&pr, p, prop)) {
+        JSValue val;
+        JSObject *getter, *setter;
+        int ret;
+        if (js_lazy_factory_call(ctx, p, prop, JS_VALUE_GET_OBJ(factory), accessor, &val, &getter, &setter) < 0)
+            return -1;
+        if (accessor)
+            return JS_DefinePropertyGetSet(ctx, obj, prop,
+                                           getter ? JS_MKPTR(JS_TAG_OBJECT, getter) : JS_UNDEFINED,
+                                           setter ? JS_MKPTR(JS_TAG_OBJECT, setter) : JS_UNDEFINED, flags);
+        ret = JS_DefinePropertyValue(ctx, obj, prop, val, flags);
+        return ret;
+    }
+    fp = JS_VALUE_GET_OBJ(JS_DupValue(ctx, factory));
+    if (JS_DefineAutoInitProperty(ctx, obj, prop, JS_AUTOINIT_ID_BYTECODE,
+                                  (void *)((uintptr_t)fp | JS_LAZY_TAG_FACTORY), flags) < 0) {
+        JS_FreeValue(ctx, JS_MKPTR(JS_TAG_OBJECT, fp));
+        return -1;
+    }
+    return 1;
 }
 
 #define JS_DEFINE_CLASS_HAS_HERITAGE     (1 << 0)
@@ -18689,6 +19243,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             *sp++ = js_dup(b->cpool[*pc++]);
             BREAK;
         CASE(OP_fclosure8):
+            /* Melt: a method that follows is defined with its closure made on first use */
+            if (pc[1] == OP_define_method) {
+                int r = js_define_lazy_method(ctx, sp[-1], get_u32(pc + 2), pc[6],
+                                              b->cpool[pc[0]], var_refs, sf);
+                if (unlikely(r < 0))
+                    goto exception;
+                if (r) {
+                    pc += 7;
+                    BREAK;
+                }
+            }
             *sp++ = js_closure(ctx, js_dup(b->cpool[*pc++]), var_refs, sf);
             if (unlikely(JS_IsException(sp[-1])))
                 goto exception;
@@ -18806,7 +19371,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 case OP_SPECIAL_OBJECT_HOME_OBJECT:
                     {
                         JSObject *p1;
-                        p1 = p->u.func.home_object;
+                        p1 = MELT_FN_HOME_OBJECT(p);
                         if (unlikely(!p1))
                             *sp++ = JS_UNDEFINED;
                         else
@@ -18989,7 +19554,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         CASE(OP_fclosure):
             {
-                JSValue bfunc = js_dup(b->cpool[get_u32(pc)]);
+                JSValue bfunc;
+                /* Melt: see OP_fclosure8 */
+                if (pc[4] == OP_define_method) {
+                    int r = js_define_lazy_method(ctx, sp[-1], get_u32(pc + 5), pc[9],
+                                                  b->cpool[get_u32(pc)], var_refs, sf);
+                    if (unlikely(r < 0))
+                        goto exception;
+                    if (r) {
+                        pc += 10;
+                        BREAK;
+                    }
+                }
+                bfunc = js_dup(b->cpool[get_u32(pc)]);
                 pc += 4;
                 *sp++ = js_closure(ctx, bfunc, var_refs, sf);
                 if (unlikely(JS_IsException(sp[-1])))
@@ -20264,11 +20841,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSAtom atom;
                 int flags, ret, op_flags;
                 bool is_computed;
-#define OP_DEFINE_METHOD_METHOD 0
-#define OP_DEFINE_METHOD_GETTER 1
-#define OP_DEFINE_METHOD_SETTER 2
-#define OP_DEFINE_METHOD_ENUMERABLE 4
-
                 is_computed = (opcode == OP_define_method_computed);
                 if (is_computed) {
                     atom = JS_ValueToAtom(ctx, sp[-2]);

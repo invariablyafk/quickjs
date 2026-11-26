@@ -1091,6 +1091,9 @@ JS_EXTERN int JS_DefinePropertyValueStr(JSContext *ctx, JSValueConst this_obj,
 JS_EXTERN int JS_DefinePropertyGetSet(JSContext *ctx, JSValueConst this_obj,
                                       JSAtom prop, JSValue getter, JSValue setter,
                                       int flags);
+/* Melt: a property made by a factory function on its first read (see quickjs.c) */
+JS_EXTERN int JS_DefineLazyProperty(JSContext *ctx, JSValueConst this_obj, JSAtom prop,
+                                    JSValueConst factory, int flags);
 /* Only supported for custom classes, returns 0 on success < 0 otherwise. */
 JS_EXTERN int JS_SetOpaque(JSValueConst obj, void *opaque);
 JS_EXTERN void *JS_GetOpaque(JSValueConst obj, JSClassID class_id);
