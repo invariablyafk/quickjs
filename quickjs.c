@@ -18721,6 +18721,123 @@ int JS_DefineLazyProperty(JSContext *ctx, JSValueConst obj, JSAtom prop, JSValue
     return 1;
 }
 
+/* Melt: a copy of the lazy property in 'spr' (its method, accessor or factory record, not yet made) added to 'dst' as its own
+   lazy property, with the flags given.  The record's references are taken again: the source keeps its own. */
+static int js_lazy_copy_property(JSContext *ctx, JSValueConst dst, JSAtom atom, JSProperty *spr, int flags)
+{
+    void *opaque = spr->u.init.opaque, *copy;
+    JSFunctionBytecode *b0;
+    JSLazyFn *m, *m2;
+    int i, n;
+
+    if (js_autoinit_is_lazy_factory(spr)) {
+        JSObject *fp = (JSObject *)((uintptr_t)opaque & ~(uintptr_t)3);
+        JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, fp));
+        copy = opaque;
+    } else {
+        m = js_lazy_get(opaque, &b0);
+        if (!m) {
+            JS_DupValue(ctx, JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, b0));
+            copy = opaque;
+        } else {
+            n = js_lazy_nvars(m->b[0]) + js_lazy_nvars(m->b[1]);
+            m2 = js_malloc(ctx, sizeof(*m2) + sizeof(m2->var_refs[0]) * n);
+            if (!m2)
+                return -1;
+            m2->b[0] = m->b[0];
+            m2->b[1] = m->b[1];
+            for(i = 0; i < n; i++) {
+                m2->var_refs[i] = m->var_refs[i];
+                JS_REF_COUNT(m2->var_refs[i])++;
+            }
+            if (m->b[0])
+                JS_DupValue(ctx, JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, m->b[0]));
+            if (m->b[1])
+                JS_DupValue(ctx, JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, m->b[1]));
+            copy = (void *)((uintptr_t)m2 | ((uintptr_t)opaque & 3));
+        }
+    }
+    if (JS_DefineAutoInitProperty(ctx, dst, atom, JS_AUTOINIT_ID_BYTECODE, copy, flags) < 0) {
+        js_lazy_free(ctx->rt, copy);
+        return -1;
+    }
+    return 0;
+}
+
+/* Melt: gives 'dst' every own property of the plain object 'src' (in its order) as a configurable one, writable when it is a
+   data property: what Object.defineProperty(dst, k, d) does for each descriptor d of Object.getOwnPropertyDescriptors(src)
+   with configurable (and writable, for a data property) set, except that a property still waiting for its first read (a lazy
+   method, accessor or factory property: JS_DefineLazyProperty, and the methods of a class or object literal) is copied as it
+   is, still unmade, where reading its descriptor would make it.  A key that dst already has goes through the descriptor, and
+   one that dst refuses is left alone.  Returns 0, or -1 on an exception. */
+int JS_MeltCopyProperties(JSContext *ctx, JSValueConst dst, JSValueConst src)
+{
+    JSObject *ps;
+    JSShape *sh;
+    JSAtom *atoms;
+    int i, n, ret = 0;
+
+    if (JS_VALUE_GET_TAG(dst) != JS_TAG_OBJECT || JS_VALUE_GET_TAG(src) != JS_TAG_OBJECT) {
+        JS_ThrowTypeError(ctx, "not an object");
+        return -1;
+    }
+    ps = JS_VALUE_GET_OBJ(src);
+    if (ps->is_exotic || ps->class_id != JS_CLASS_OBJECT) {
+        JS_ThrowTypeError(ctx, "not a plain object");
+        return -1;
+    }
+    sh = ps->shape;
+    /* the keys first: the copy changes the destination, and a descriptor read can run code */
+    atoms = js_malloc(ctx, sizeof(JSAtom) * (sh->prop_count + 1));
+    if (!atoms)
+        return -1;
+    for(i = 0, n = 0; i < sh->prop_count; i++) {
+        JSShapeProperty *prs = &get_shape_prop(sh)[i];
+        if (prs->atom != JS_ATOM_NULL)
+            atoms[n++] = JS_DupAtom(ctx, prs->atom);
+    }
+    for(i = 0; i < n && ret == 0; i++) {
+        JSProperty *spr, *dpr;
+        JSObject *pd = JS_VALUE_GET_OBJ(dst);
+        JSShapeProperty *srs = find_own_property(&spr, ps, atoms[i]);
+        JSPropertyDescriptor d;
+        int r, f;
+        if (!srs)
+            continue;
+        if ((srs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT && js_autoinit_is_lazy(spr) &&
+            !pd->is_exotic && pd->extensible && !__JS_AtomIsTaggedInt(atoms[i]) &&
+            !find_own_property(&dpr, pd, atoms[i])) {
+            f = (srs->flags & JS_PROP_ENUMERABLE) | JS_PROP_CONFIGURABLE;
+            if (!js_autoinit_is_lazy_accessor(spr) && !js_autoinit_is_lazy_factory(spr))
+                f |= JS_PROP_WRITABLE;
+            else if (js_autoinit_is_lazy_factory(spr))
+                f |= (srs->flags & JS_PROP_WRITABLE);
+            if (js_lazy_copy_property(ctx, dst, atoms[i], spr, f) < 0)
+                ret = -1;
+            continue;
+        }
+        r = JS_GetOwnPropertyInternal(ctx, &d, ps, atoms[i]);
+        if (r < 0) {
+            ret = -1;
+            break;
+        }
+        if (!r)
+            continue;
+        f = JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE | JS_PROP_HAS_ENUMERABLE | (d.flags & JS_PROP_ENUMERABLE);
+        if (d.flags & JS_PROP_GETSET)
+            f |= JS_PROP_HAS_GET | JS_PROP_HAS_SET;
+        else
+            f |= JS_PROP_HAS_VALUE | JS_PROP_HAS_WRITABLE | JS_PROP_WRITABLE;
+        if (JS_DefineProperty(ctx, dst, atoms[i], d.value, d.getter, d.setter, f) < 0 && JS_HasException(ctx))
+            JS_FreeValue(ctx, JS_GetException(ctx));
+        js_free_desc(ctx, &d);
+    }
+    for(i = 0; i < n; i++)
+        JS_FreeAtom(ctx, atoms[i]);
+    js_free(ctx, atoms);
+    return ret;
+}
+
 #define JS_DEFINE_CLASS_HAS_HERITAGE     (1 << 0)
 
 static int js_op_define_class(JSContext *ctx, JSValue *sp,
@@ -23428,8 +23545,14 @@ typedef struct JSFunctionDef {
     int col_num;
     DynBuf pc2line;
 
-    char *source;  /* raw source, utf-8 encoded */
+    /* Melt: the function's text is not copied while parsing: `source` points into the text being
+       compiled (the parse's input, which outlives js_create_function) and is never freed;
+       js_create_function copies it into the finished function unless `no_source` (the output is
+       written stripped, JS_EVAL_FLAG_NO_SOURCE).  A copy per function and per enclosing function
+       was 23 to 46 percent of the compile's peak. */
+    const char *source;
     int source_len;
+    bool no_source;
 
     JSModuleDef *module; /* != NULL when parsing a module */
 } JSFunctionDef;
@@ -27049,11 +27172,8 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
     put_u32(fd->byte_code.buf + ctor_cpool_offset, ctor_fd->parent_cpool_idx);
 
     /* store the class source code in the constructor. */
-    js_free(ctx, ctor_fd->source);
     ctor_fd->source_len = s->buf_ptr - class_start_ptr;
-    ctor_fd->source = js_strndup(ctx, (const char *)class_start_ptr, ctor_fd->source_len);
-    if (!ctor_fd->source)
-        goto fail;
+    ctor_fd->source = (const char *)class_start_ptr;   /* Melt: not copied (see JSFunctionDef) */
 
     /* consume the '}' */
     if (next_token(s))
@@ -34040,6 +34160,7 @@ static JSFunctionDef *js_new_function_def(JSContext *ctx,
         list_add_tail(&fd->link, &parent->child_list);
         fd->is_strict_mode = parent->is_strict_mode;
         fd->parent_scope_level = parent->scope_level;
+        fd->no_source = parent->no_source;
     }
 
     fd->is_eval = is_eval;
@@ -34175,8 +34296,6 @@ static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd)
     JS_FreeAtom(ctx, fd->filename);
     dbuf_free(&fd->pc2line);
 
-    js_free(ctx, fd->source);
-
     if (fd->parent) {
         /* remove in parent list */
         list_del(&fd->link);
@@ -34277,7 +34396,6 @@ static void cp_fd(JSRuntime *rt, JSFunctionDef *fd, CPSample *c)
     c->globals += cp_blk(rt, fd->global_vars, &c->blocks);
     c->closure += cp_blk(rt, fd->closure_var, &c->blocks);
     c->cpool_arr += cp_blk(rt, fd->cpool, &c->blocks);
-    c->source += cp_blk(rt, fd->source, &c->blocks);
     for (i = 0; i < fd->cpool_count; i++) {
         JSValue v = fd->cpool[i];
         if (JS_VALUE_GET_TAG(v) == JS_TAG_STRING || JS_VALUE_GET_TAG(v) == JS_TAG_STRING_ROPE)
@@ -38288,6 +38406,7 @@ static int add_module_variables(JSContext *ctx, JSFunctionDef *fd)
    must be done this way to resolve all the variables. */
 static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
 {
+    char *source_copy = NULL;
     JSValue exc_before = ctx->rt->current_exception;   /* Melt: js_thrown_since */
     JSValue func_obj;
     JSFunctionBytecode *b;
@@ -38400,9 +38519,18 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     byte_code_offset = function_size;
     function_size += fd->byte_code.size;
 
+    /* Melt: the text is copied now, from the parse's input, and only when the output keeps it */
+    if (fd->source && !fd->no_source) {
+        source_copy = js_strndup(ctx, fd->source, fd->source_len);
+        if (!source_copy)
+            goto fail;
+    }
+
     b = js_mallocz(ctx, function_size);
-    if (!b)
+    if (!b) {
+        js_free(ctx, source_copy);
         goto fail;
+    }
     JS_REF_COUNT(b) = 1;
 
     b->byte_code_buf = (void *)((uint8_t*)b + byte_code_offset);
@@ -38447,8 +38575,8 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     if (!b->pc2line_buf)
         b->pc2line_buf = fd->pc2line.buf;
     b->pc2line_len = fd->pc2line.size;
-    b->source = fd->source;
-    b->source_len = fd->source_len;
+    b->source = source_copy;
+    b->source_len = source_copy ? fd->source_len : 0;
 
     if (fd->scopes != fd->def_scope_array)
         js_free(ctx, fd->scopes);
@@ -39205,9 +39333,7 @@ static __exception int js_parse_function_decl2(JSParseState *s,
             /* the end of the function source code is after the last
                 token of the function source stored into s->last_ptr */
             fd->source_len = s->last_ptr - ptr;
-            fd->source = js_strndup(ctx, (const char *)ptr, fd->source_len);
-            if (!fd->source)
-                goto fail;
+            fd->source = (const char *)ptr;   /* Melt: not copied (see JSFunctionDef) */
 
             goto done;
         }
@@ -39243,9 +39369,7 @@ static __exception int js_parse_function_decl2(JSParseState *s,
 
         /* save the function source code */
         fd->source_len = s->buf_ptr - ptr;
-        fd->source = js_strndup(ctx, (const char *)ptr, fd->source_len);
-        if (!fd->source)
-            goto fail;
+        fd->source = (const char *)ptr;   /* Melt: not copied (see JSFunctionDef) */
 
         if (next_token(s)) {
             /* consume the '}' */
@@ -39281,6 +39405,23 @@ static __exception int js_parse_function_decl2(JSParseState *s,
     }
 done:
     s->cur_func = fd->parent;
+
+    /* Melt: the first-pass code and label slots wait (until the whole file has parsed) at the size they
+       have, not at the growth slack of the buffers (a fifth of them) */
+    if (fd->byte_code.buf && fd->byte_code.size > 0 && fd->byte_code.allocated_size > fd->byte_code.size) {
+        uint8_t *q = js_realloc(ctx, fd->byte_code.buf, fd->byte_code.size);
+        if (q) {
+            fd->byte_code.buf = q;
+            fd->byte_code.allocated_size = fd->byte_code.size;
+        }
+    }
+    if (fd->label_slots && fd->label_count > 0 && fd->label_size > fd->label_count) {
+        LabelSlot *q = js_realloc(ctx, fd->label_slots, fd->label_count * sizeof(*q));
+        if (q) {
+            fd->label_slots = q;
+            fd->label_size = fd->label_count;
+        }
+    }
 
     /* Reparse identifiers after the function is terminated so that
        the token is parsed in the englobing function. It could be done
@@ -39621,6 +39762,7 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
     fd->eval_type = eval_type;
     fd->has_this_binding = (eval_type != JS_EVAL_TYPE_DIRECT);
     fd->backtrace_barrier = ((flags & JS_EVAL_FLAG_BACKTRACE_BARRIER) != 0);
+    fd->no_source = ((flags & JS_EVAL_FLAG_NO_SOURCE) != 0);
     if (eval_type == JS_EVAL_TYPE_DIRECT) {
         fd->new_target_allowed = b->new_target_allowed;
         fd->super_call_allowed = b->super_call_allowed;

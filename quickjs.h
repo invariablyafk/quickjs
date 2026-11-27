@@ -466,6 +466,11 @@ static inline bool JS_VALUE_IS_NAN(JSValue v)
 /* Melt: with JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY, don't resolve (load) the imported
    modules yet; call JS_ResolveModule() later, once they are all compiled */
 #define JS_EVAL_FLAG_DEFER_RESOLVE (1 << 8)
+/* Melt: the compiled functions keep no source text (Function.prototype.toString then gives the
+   "[native code]" form), for a caller that writes the result with JS_WRITE_OBJ_STRIP_SOURCE.  The
+   text is never copied while parsing (see JSFunctionDef.source); this skips the copy that
+   js_create_function would make. */
+#define JS_EVAL_FLAG_NO_SOURCE (1 << 9)
 
 typedef JSValue JSCFunction(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 typedef JSValue JSCFunctionMagic(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
@@ -1094,6 +1099,8 @@ JS_EXTERN int JS_DefinePropertyGetSet(JSContext *ctx, JSValueConst this_obj,
 /* Melt: a property made by a factory function on its first read (see quickjs.c) */
 JS_EXTERN int JS_DefineLazyProperty(JSContext *ctx, JSValueConst this_obj, JSAtom prop,
                                     JSValueConst factory, int flags);
+/* Melt: copies the own properties of a plain object to another as configurable ones, lazy ones still unmade (see quickjs.c) */
+JS_EXTERN int JS_MeltCopyProperties(JSContext *ctx, JSValueConst dst, JSValueConst src);
 /* Only supported for custom classes, returns 0 on success < 0 otherwise. */
 JS_EXTERN int JS_SetOpaque(JSValueConst obj, void *opaque);
 JS_EXTERN void *JS_GetOpaque(JSValueConst obj, JSClassID class_id);
